@@ -1676,11 +1676,22 @@ static inline float density_fade(float rank, float count_morph)
  * front. Below half the full set it wanders fully; above, it blends back to
  * the fixed rank order, which the full set (no wander) is exactly. The energy
  * compensation holds the level as it goes. */
-#define WANDER_T0_HZ  2.0f
-#define WANDER_T1_HZ  1.3f
-#define WANDER_T2_HZ  0.8f
-#define WANDER_ELIG   0.1f
-#define WANDER_SHARP  4.0f     /* a quarter of each tap's time is spent changing over */     /* energy, relative to the loudest tap: -10 dB */
+/* Slow, so a tap comes and goes over seconds rather than being heard to
+ * switch: at T0's 0.4 taps a second each tap has 2.5 s, half of it spent
+ * fading (WANDER_SHARP 2), each fade on an S-curve. */
+#ifndef WANDER_T0_HZ
+#define WANDER_T0_HZ  0.4f
+#endif
+#ifndef WANDER_T1_HZ
+#define WANDER_T1_HZ  0.26f
+#endif
+#ifndef WANDER_T2_HZ
+#define WANDER_T2_HZ  0.16f
+#endif
+#define WANDER_ELIG   0.1f     /* energy, relative to the loudest tap: -10 dB */
+#ifndef WANDER_SHARP
+#define WANDER_SHARP  2.0f     /* half of each tap's time is spent changing over */
+#endif
 typedef struct {
     float pos;                 /* window start, as a fraction of the circle */
     uint32_t last_block;       /* block of the last recompute */
@@ -1690,9 +1701,21 @@ static uint8_t t0TapOrder[MAX_T0_TAPS], t1TapOrder[MAX_T1_TAPS], t2TapOrder[MAX_
 static uint32_t wander_blocks;      /* blocks run, for the wander's clock */
 static uint8_t density_wandering;   /* any stage wandering: keep its gains recomputing */
 
+/* The wander, on (0 holds the taps still). As taps come and go, each stage's
+ * total tap energy holds: the level compensation carries whichever taps are
+ * sounding, with the stage make-up (stage_fit) taking what a Q15 gain cannot
+ * hold. */
+#ifndef DENSITY_WANDER
+#define DENSITY_WANDER 1
+#endif
+
 /* 1 from half the taps down, falling to 0 at the full set. */
 static inline float wander_amount(float count_morph, int n)
 {
+#if !DENSITY_WANDER
+    (void)count_morph; (void)n;
+    return 0.0f;
+#endif
     float x = ((float)n - count_morph) / (0.5f * (float)n);
     if (x < 0.0f) x = 0.0f; else if (x > 1.0f) x = 1.0f;
     return x;
@@ -1767,6 +1790,7 @@ static float density_apply(float *pre, const float *ranks, const uint8_t *order,
                  * level. */
                 ww = (ww - 0.5f) * WANDER_SHARP + 0.5f;
                 if (ww < 0.0f) ww = 0.0f; else if (ww > 1.0f) ww = 1.0f;
+                ww = ww * ww * (3.0f - 2.0f * ww);   /* ease in and out of each fade */
             }
         }
         const float sw = density_fade(ranks[t], count_morph);
@@ -2127,6 +2151,12 @@ static inline int16_t soft_saturate_q15(int32_t x)
     float v = (float)x * (1.0f / 1073741824.0f);   /* 2^30 == full scale */
     return (int16_t)(soft_clip_unit(v) * 32767.0f);
 }
+/* The same, with a stage's make-up gain (see stage_fit). */
+static inline int16_t soft_saturate_q15_g(int32_t x, float g)
+{
+    float v = (float)x * (g * (1.0f / 1073741824.0f));
+    return (int16_t)(soft_clip_unit(v) * 32767.0f);
+}
 
 /* Hard int16 clamp — kept for coefficient clamping (effGains) and anywhere a
  * true hard limit is wanted. */
@@ -2330,7 +2360,29 @@ static void compute_tap_states_lr(const uint32_t *ladderL, const uint32_t *ladde
  * Applied directly rather than morphed: the count it follows is already
  * smoothed. Capped at what a single tap needs; clamp_f_to_int16 holds the
  * resulting gains inside int16. */
-#define DENSITY_COMP_MAX  6.4f      /* sqrt(40): one T0/T1 tap standing in for all 40 */
+/* A safety limit only: one tap standing in for a whole stage (116 in T0) can
+ * need sqrt(116) ~ 11, and more if it is one of the stage's quieter taps (up
+ * to 10 dB down, see WANDER_ELIG). Gains past what a Q15 gain holds are
+ * carried by the stage's make-up instead (see stage_fit). */
+#define DENSITY_COMP_MAX  40.0f
+/* A stage's gains past what a Q15 gain holds (a few taps carrying the whole
+ * stage at low Density) are scaled down to fit, and the stage's output is
+ * scaled back up by the same in float where its accumulator is converted
+ * (soft_saturate_q15_g). Without this the gains clipped and the stage went
+ * quiet, by up to 9 dB, whenever a quiet tap was carrying it. Returns the
+ * make-up, >= 1. */
+static float t0_makeup = 1.0f, t1_makeup = 1.0f, t2_makeup_l = 1.0f, t2_makeup_r = 1.0f;
+static float stage_fit(float *g, int n, float scale)
+{
+    float m = 0.0f;
+    for (int t = 0; t < n; t++) { const float a = fabsf(g[t] * scale); if (a > m) m = a; }
+    const float lim = 32000.0f;
+    const float mk = m > lim ? m / lim : 1.0f;
+    const float k = scale / mk;
+    for (int t = 0; t < n; t++) g[t] *= k;
+    return mk;
+}
+
 static inline float density_comp(float full, float thinned)
 {
     if (thinned <= 1e-3f || full <= 1e-3f) return 1.0f;
@@ -2381,9 +2433,8 @@ static void recompute_eff_gains_t0(void)
     t0_comp_goal = comp;
     t0_tap_comp_morph += ALPHA_WINDOW_MORPH * (comp - t0_tap_comp_morph);
 
-    for (int t = 0; t < count; t++) {
-        effGains_t0[t] = clamp_f_to_int16(pre[t] * t0_tap_comp_morph);
-    }
+    t0_makeup = stage_fit(pre, count, t0_tap_comp_morph);
+    for (int t = 0; t < count; t++) effGains_t0[t] = clamp_f_to_int16(pre[t]);
 }
 
 /* T1's decay envelope, for small Sizes.
@@ -2475,9 +2526,8 @@ static void recompute_eff_gains_t1(void)
         if (e1 > 1e-3f) { const float k = sqrtf(e0 / e1); for (int t = 0; t < count; t++) pre[t] *= k; }
     }
 
-    for (int t = 0; t < count; t++) {
-        effGains_t1[t] = clamp_f_to_int16(pre[t] * t1_tap_comp_morph);
-    }
+    t1_makeup = stage_fit(pre, count, t1_tap_comp_morph);
+    for (int t = 0; t < count; t++) effGains_t1[t] = clamp_f_to_int16(pre[t]);
 }
 
 static void recompute_eff_gains_t2(void)
@@ -2534,21 +2584,12 @@ static void recompute_eff_gains_t2(void)
     t2_comp_goal = comp;
     t2_tap_comp_morph += ALPHA_WINDOW_MORPH * (comp - t2_tap_comp_morph);
 
-    /* A side left with a lone tap can ask for more gain than a Q15 gain
-     * holds; the clamp then leaves it quieter than the other, by however
-     * much depends on which tap it has. So both sides take the level of the
-     * quieter one. */
-    float eL = 0.0f, eR = 0.0f;
+    /* Each side to fit its own Q15 gains, with its own make-up. */
+    t2_makeup_l = stage_fit(pre, count, t2_tap_comp_morph);
+    t2_makeup_r = stage_fit(preR, count, t2_tap_comp_morph);
     for (int t = 0; t < count; t++) {
-        const float gl = (float)clamp_f_to_int16(pre[t] * t2_tap_comp_morph);
-        const float gr = (float)clamp_f_to_int16(preR[t] * t2_tap_comp_morph);
-        eL += gl * gl; eR += gr * gr;
-    }
-    float kL = 1.0f, kR = 1.0f;
-    if (eL > eR && eL > 0.0f) kL = sqrtf(eR / eL); else if (eR > eL && eR > 0.0f) kR = sqrtf(eL / eR);
-    for (int t = 0; t < count; t++) {
-        effGains_t2[t] = clamp_f_to_int16(pre[t] * t2_tap_comp_morph * kL);
-        effGains_t2R[t] = clamp_f_to_int16(preR[t] * t2_tap_comp_morph * kR);
+        effGains_t2[t] = clamp_f_to_int16(pre[t]);
+        effGains_t2R[t] = clamp_f_to_int16(preR[t]);
 #if REVERB_T2_R_SIGNS
         if (t2FlipR[t]) effGains_t2R[t] = (int16_t)-effGains_t2R[t];
 #endif
@@ -3969,8 +4010,8 @@ static void do_bridge_t0_to_t1(void)
 #ifdef VELVET_REVERB_HOST
         host_note_sat(accT0[i], &host_dbg_t01_peak, &host_dbg_t01_sat);
 #endif
-        t1_ring[wi & T1_RING_MASK] = soft_saturate_q15(accT0[i]);
-        t1_ring_r[wi & T1_RING_MASK] = soft_saturate_q15(accT0_r[i]);
+        t1_ring[wi & T1_RING_MASK] = soft_saturate_q15_g(accT0[i], t0_makeup);
+        t1_ring_r[wi & T1_RING_MASK] = soft_saturate_q15_g(accT0_r[i], t0_makeup);
         accT1[i] = 0;
         accT1_r[i] = 0;
     }
@@ -4077,13 +4118,13 @@ static void do_bridge_t1_to_t2(void)
         host_note_sat(accT1[i],     &host_dbg_t12_peak, &host_dbg_t12_sat);
         host_note_sat(accT1[i + 1], &host_dbg_t12_peak, &host_dbg_t12_sat);
 #endif
-        int16_t s0 = pre_t2_sat(soft_saturate_q15(accT1[i]));
-        int16_t s1 = pre_t2_sat(soft_saturate_q15(accT1[i + 1]));
+        int16_t s0 = pre_t2_sat(soft_saturate_q15_g(accT1[i], t1_makeup));
+        int16_t s1 = pre_t2_sat(soft_saturate_q15_g(accT1[i + 1], t1_makeup));
         uint32_t packed = ((uint32_t)(uint16_t)s1 << 16) | (uint32_t)(uint16_t)s0;
         uint32_t wi = block_write_idx + (uint32_t)i;
         *((volatile u32_alias *)&t2_ring[wi & T2_RING_MASK]) = packed;
-        int16_t r0 = pre_t2_sat(soft_saturate_q15(accT1_r[i]));
-        int16_t r1 = pre_t2_sat(soft_saturate_q15(accT1_r[i + 1]));
+        int16_t r0 = pre_t2_sat(soft_saturate_q15_g(accT1_r[i], t1_makeup));
+        int16_t r1 = pre_t2_sat(soft_saturate_q15_g(accT1_r[i + 1], t1_makeup));
         packed = ((uint32_t)(uint16_t)r1 << 16) | (uint32_t)(uint16_t)r0;
         *((volatile u32_alias *)&t2_ring_r[wi & T2_RING_MASK]) = packed;
     }
@@ -4165,8 +4206,8 @@ static void do_finalize(void)
     /* Baseline for A/B, both sonic and for cycle counting: the pre-limiter output
      * path, writing straight through with no look-ahead buffer, peak scan or gain. */
     for (int i = 0; i < REVERB_BLOCK; i++) {
-        float rawL = (float)soft_saturate_q15(accL[i]) * REVERB_OUT_MAKEUP;
-        float rawR = (float)soft_saturate_q15(accR[i]) * REVERB_OUT_MAKEUP;
+        float rawL = (float)soft_saturate_q15_g(accL[i], t2_makeup_l) * REVERB_OUT_MAKEUP;
+        float rawR = (float)soft_saturate_q15_g(accR[i], t2_makeup_r) * REVERB_OUT_MAKEUP;
         float m = 0.5f * (rawL + rawR);
         float s = 0.5f * (rawL - rawR) * REVERB_STEREO_WIDTH;
         float curL = m + s;
@@ -4202,8 +4243,8 @@ static void do_finalize(void)
         host_note_sat(accL[i], &host_dbg_out_peak, &host_dbg_out_sat);
         host_note_sat(accR[i], &host_dbg_out_peak, &host_dbg_out_sat);
 #endif
-        float rawL = (float)soft_saturate_q15(accL[i]) * (REVERB_OUT_MAKEUP / 32768.0f);
-        float rawR = (float)soft_saturate_q15(accR[i]) * (REVERB_OUT_MAKEUP / 32768.0f);
+        float rawL = (float)soft_saturate_q15_g(accL[i], t2_makeup_l) * (REVERB_OUT_MAKEUP / 32768.0f);
+        float rawR = (float)soft_saturate_q15_g(accR[i], t2_makeup_r) * (REVERB_OUT_MAKEUP / 32768.0f);
         float m = 0.5f * (rawL + rawR);
         float s = 0.5f * (rawL - rawR) * REVERB_STEREO_WIDTH;
         float curL = m + s;
