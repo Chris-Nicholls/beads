@@ -1,296 +1,401 @@
-// Copyright 2017-2021 Emilie Gillet.
+// Reverb-only firmware for the Beads hardware: the DLD velvet reverb
+// (beads/velvet/velvet_reverb.c) in place of the granular engine.
 //
-// Author: Emilie Gillet (emilie.o.gillet@gmail.com)
-// Author: Frédéric Meslin (fred@fredslab.net)
-// Author: Oliver Rockstedt (info@sourcebox.de)
+// The original granular main is kept as beads_granular.cc.orig.
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-// 
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-// 
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
-// 
-// See http://creativecommons.org/licenses/MIT/ for more information.
+// Panel:
+//   TIME knob           Pre-delay: the whole reverb comes in up to 1 s after
+//                       the dry signal (square law, short times get the
+//                       travel)
+//   SIZE knob           The space and its decay together, as the DLD's Decay
+//                       knob: how long the reverb's taps are spread over, how
+//                       long they take to fade, and the sustain loop's
+//                       feedback; the DLD's default a little past noon
+//   SHAPE knob          Tone macro
+//   TIME, SIZE, SHAPE and PITCH each have an attenuverter and a CV input, which
+//   work as on Beads (RandomizedParameter): with the CV jack patched, clockwise
+//   scales the CV and counter-clockwise lets the CV set an amount of random
+//   modulation; with it unpatched the knob is an attenurandomizer, a random
+//   walk whose depth grows either side of noon, fast clockwise and slow
+//   counter-clockwise; PITCH's, clockwise, makes octave jumps instead (see
+//   OctaveJumps). Patching is sensed by Beads' normalization probe.
+//   DENSITY knob        Density macro (+ DENSITY CV): taps per reverb stage,
+//                       from a sparse few to the full set (the DLD's sound)
+//                       fully clockwise
+//   DRY/WET knob        Reverb send (equal power; the wet output is 2x the
+//                       DLD's, REVERB_OUT_GAIN). The top 10% fades the dry
+//                       signal out, so the knob's end is 100% reverb.
+//   PITCH knob          Pitch shift of the reverb feed, on Beads' own detented
+//                       interval law (0, 1, 3, 4, 7, 12 semitones either way),
+//                       + the PITCH CV input, 1 V/oct with its attenuverter
+//                       fully clockwise, together held to ±12
+//   REVERB knob         Level of the pitch-shifted feed: 0 none, noon an equal
+//                       blend, fully clockwise only the shifted feed
+//   FREEZE button/gate  Freezes the sustain loop: no new input, no decay.
+//                       New input skips the loop and goes straight to the
+//                       reverb's taps (after TIME's pre-delay). The button
+//                       latches; the gate freezes while high. The button
+//                       lights while frozen.
+//   SEED button/gate    Reverse: the sustain loop is read backwards into the
+//                       reverb. The button latches; the gate reverses while
+//                       high. The button lights while reversed.
+//   QUALITY button      Picks what the FEEDBACK knob sets: the reverb's
+//                       modulation, then the wet-signal effects sample-rate
+//                       reduction, tape saturation and flutter, in turn.
+//                       Holding it returns all four to zero.
+//   FEEDBACK knob       The selection's amount, once it is moved (a newly
+//                       selected one keeps its amount until then). Modulation
+//                       deepens the reverb's own tap and loop modulation from
+//                       its stock depth at zero. The effects run on the wet
+//                       signal only, after the reverb's final taps and before
+//                       its tone filters (wet_fx.c).
+//   Quality LED         The selection: red = modulation, green = sample-rate
+//                       reduction, amber = saturation, blue = flutter; brighter
+//                       as its amount rises
+//   VU LED              Input level
+//
+// Audio runs at 48 kHz in 12-frame blocks (4 kHz block rate). The reverb runs
+// at 24 kHz: its input is decimated in velvet_reverb_push_sample() and its
+// 16-sample blocks are processed in the main loop, as on the DLD.
+//
+// Based on Beads by Emilie Gillet (MIT) and the DLD velvet reverb (MIT).
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 
-#include "beads/background_buffer_backup.h"
-#include "beads/calibrator.h"
 #include "beads/cv_reader.h"
 #include "beads/drivers/codec.h"
-#include "beads/drivers/debug_pin.h"
 #include "beads/drivers/freeze_input.h"
+#include "beads/drivers/leds.h"
 #include "beads/drivers/seed_input.h"
+#include "beads/drivers/switches.h"
 #include "beads/drivers/system.h"
 #include "beads/drivers/watchdog.h"
-#include "beads/dsp/processor.h"
-#include "beads/dsp/synth.h"
-#include "beads/factory_test.h"
-#include "beads/gain_control.h"
+#include "beads/dsp/randomized_parameter.h"
 #include "beads/normalization_detector.h"
 #include "beads/settings.h"
-#include "beads/ui.h"
+#include "beads/velvet/velvet_reverb.h"
+#include "beads/velvet/wet_fx.h"
+#include "stmlib/stmlib.h"
 
-using namespace std;
 using namespace beads;
 using namespace stmlib;
 
+const int kSampleRate = 48000;
 const int kBlockRate = 4000;
 
-const bool skip_factory_test = false;
+// The reverb's big buffers. These sections are NOLOAD (never cleared at
+// start-up), so Init() zeroes them before the reverb starts.
+//   RAM_D1 (512 KiB): the T2 ring, 256 KiB at 24 kHz; the rest is free.
+//   RAM_D2 (256 KiB): the two float sustain-loop lines (128 KiB together) and
+//   the int16 input delay ring (64 KiB).
+// T0/T1 rings and all other reverb state are ordinary .bss, which is DTCM.
+int16_t beads_t2_ring_storage[T2_RING_SAMPLES] __attribute__ ((section (".ramd1")));
+float beads_predelay_a_storage[PRE_DELAY_LINE_SAMPLES] __attribute__ ((section (".ramd2")));
+float beads_predelay_b_storage[PRE_DELAY_LINE_SAMPLES] __attribute__ ((section (".ramd2")));
+int16_t beads_input_delay_storage[INPUT_DELAY_SAMPLES] __attribute__ ((section (".ramd2")));
 
-uint8_t delay_buffer_1[512 * 1024] __attribute__ ((section (".ramd1")));
-uint8_t delay_buffer_2[256 * 1024] __attribute__ ((section (".ramd2")));
-uint16_t reverb_buffer[32768] __attribute__ ((section (".ramd3")));
-
-BackgroundBufferBackup background_buffer_backup;
-Calibrator calibrator;
-CvReader cv_reader;
 Codec codec;
-FactoryTest factory_test;
 FreezeInput freeze_input;
-GainControl gain_control;
-NormalizationDetector normalization_detector;
-Processor processor;
 SeedInput seed_input;
+NormalizationDetector normalization_detector;
+CvReader cv_reader;
+Leds leds;
 Settings settings;
-Synth synth;
-Ui ui;
+Switches switches;
 
 volatile bool ready = false;
 
-// #define PROFILE_INTERRUPT
+// Written by the audio callback, read by the main loop.
+volatile float predelay_target = 0.0f;
+volatile float size_target = 0.305f;   // the DLD's default, through kSizeLaw
+// SIZE's knob law: the macro is the knob position (with its CV) to this
+// power, so the top end gets more of the travel: what was noon now sits at
+// 9 o'clock (0.2^kSizeLaw = 0.5), and the DLD's default (macro 0.6) at 0.3.
+const float kSizeLaw = 0.4307f;
+volatile float tone_target = 0.5f;
+volatile float density_target = 1.0f;
+volatile float pitch_target = 0.0f;
+volatile float pitch_mix_target = 0.0f;
+volatile bool freeze_latched = false;
+volatile bool frozen = false;
+volatile bool reverse_latched = false;
+volatile bool reversed = false;
+volatile float input_peak = 0.0f;
+
+// QUALITY selections: the reverb's modulation, then the wet effects (slot
+// 1 + their wet_fx index). The QUALITY button (SysTick) picks the selection
+// and bumps fx_select_seq on every pick or reset; Process re-arms the
+// FEEDBACK knob's takeover when it sees the sequence change.
+const uint32_t kFxHoldMs = 600;
+const int kFxModulation = 0;
+const int kFxSlots = 1 + WET_FX_COUNT;
+volatile uint8_t fx_selected = kFxModulation;
+volatile float fx_amount[kFxSlots] = { 0.0f, 0.0f, 0.0f, 0.0f };
+volatile uint32_t fx_select_seq = 0;
+
+// Written by the main loop, read by the audio callback.
+volatile float send_gain = 0.7f;
+volatile float dry_gain = 1.0f;
 
 extern "C" {
-  
+
 void SysTick_Handler() {
-  // Takes about 2µs to complete
   HAL_IncTick();
   Watchdog::Reload();
   if (!ready) {
     return;
   }
-  ui.Poll();
-  if (!skip_factory_test) {
-    factory_test.Poll();
+
+  switches.Debounce();
+  if (switches.just_pressed(SWITCH_FREEZE)) {
+    freeze_latched = !freeze_latched;
   }
+  if (switches.just_pressed(SWITCH_SEED)) {
+    reverse_latched = !reverse_latched;
+  }
+  leds.set(LED_FREEZE, frozen ? 255 : 0);
+  leds.set(LED_SEED, reversed ? 255 : 0);
+
+  // QUALITY: a short press steps the selection, a hold turns every effect off
+  // (and the release that ends it does not also step).
+  static uint32_t media_held_ms = 0;
+  static bool media_hold_fired = false;
+  if (switches.pressed(SWITCH_MEDIA)) {
+    if (++media_held_ms == kFxHoldMs) {
+      for (int i = 0; i < kFxSlots; ++i) fx_amount[i] = 0.0f;
+      ++fx_select_seq;
+      media_hold_fired = true;
+    }
+  } else {
+    if (media_held_ms && !media_hold_fired) {
+      fx_selected = (fx_selected + 1) % kFxSlots;
+      ++fx_select_seq;
+    }
+    media_held_ms = 0;
+    media_hold_fired = false;
+  }
+
+  // The selection on the quality LED, brighter with its amount.
+  static const uint8_t kFxColor[kFxSlots][3] = {
+    { 255, 0, 0 },     // modulation
+    { 0, 160, 0 },     // sample-rate reduction
+    { 255, 110, 0 },   // saturation
+    { 0, 40, 255 },    // flutter
+  };
+  const uint8_t sel = fx_selected;
+  const float level = 0.12f + 0.88f * fx_amount[sel];
+  Leds::Color c;
+  c.r = uint8_t(kFxColor[sel][0] * level);
+  c.g = uint8_t(kFxColor[sel][1] * level);
+  c.b = uint8_t(kFxColor[sel][2] * level);
+  leds.set_media(c);
+
+  // VU meter: peak hold with a ~150 ms release at 1 kHz.
+  float peak = input_peak;
+  input_peak = peak * 0.993f;
+  leds.set(LED_VU_METER, uint8_t(std::min(peak * 4.0f, 1.0f) * 255.0f));
+  leds.Write();
 }
 
 }
 
+static inline int16_t SaturateInt16(float x) {
+  x = std::max(std::min(x, 32767.0f), -32768.0f);
+  return static_cast<int16_t>(x);
+}
 
-// This counter is used to temporarily blank the codec output and disable
-// the AGC while the normalization detection system is still catching up with
-// a codec restart.
-int codec_transition_frames;
-bool synth_mode;
-int synth_mode_start_time;
+// The random walks behind the attenurandomizers, one per parameter, at the
+// rate Beads' own (its pitch modulation) uses.
+RandomWalkModulation time_walk, size_walk, shape_walk, pitch_walk;
+const float kWalkFrequency = 0.2f / float(kSampleRate);
 
-GateFlags previous_seed;
-stmlib::DelayLine<Codec::Event, 256> event_delay;
+// PITCH's attenurandomizer clockwise of noon (jack unpatched): instead of a
+// drift, the pitch jumps an octave up or down and comes back. The amount sets
+// how often (a mean gap from kJumpGapMaxS down to kJumpGapMinS, random
+// between jumps) and for how long (kJumpHoldMinS up to kJumpHoldMaxS, give or
+// take a third). A jump that would leave the reverb's +/-12 semitones goes
+// the other way.
+const float kJumpGapMaxS = 16.0f, kJumpGapMinS = 1.0f;
+const float kJumpHoldMinS = 0.12f, kJumpHoldMaxS = 1.5f;
+
+class OctaveJumps {
+ public:
+  void Init() { wait_ = hold_ = 0; offset_ = 0.0f; }
+
+  // Advances n codec frames; returns the jump offset in semitones.
+  float Process(float amount, float base, size_t n) {
+    if (amount <= 0.0f) { Init(); return 0.0f; }
+    if (hold_ > 0) {
+      hold_ -= static_cast<int32_t>(n);
+      if (hold_ <= 0) { offset_ = 0.0f; wait_ = DrawGap(amount); }
+      return offset_;
+    }
+    if (wait_ <= 0) wait_ = DrawGap(amount);   // just engaged
+    wait_ -= static_cast<int32_t>(n);
+    if (wait_ <= 0) {
+      offset_ = stmlib::Random::GetFloat() < 0.5f ? 12.0f : -12.0f;
+      if (base + offset_ > 12.0f || base + offset_ < -12.0f) offset_ = -offset_;
+      const float hold = kJumpHoldMinS * powf(kJumpHoldMaxS / kJumpHoldMinS, amount) *
+          (0.67f + 0.66f * stmlib::Random::GetFloat());
+      hold_ = static_cast<int32_t>(hold * float(kSampleRate));
+    }
+    return offset_;
+  }
+
+ private:
+  static int32_t DrawGap(float amount) {
+    const float mean = kJumpGapMaxS * powf(kJumpGapMinS / kJumpGapMaxS, amount);
+    const float u = 1.0f - stmlib::Random::GetFloat();   // (0, 1]
+    return static_cast<int32_t>(-logf(u) * mean * float(kSampleRate));
+  }
+  int32_t wait_, hold_;
+  float offset_;
+};
+OctaveJumps octave_jumps;
+
+// The normalization probe is audible on unpatched audio inputs, and the
+// detector needs a few decisions to settle, so the output stays muted for a
+// moment at start-up, as on Beads (codec_transition_frames).
+int startup_mute_blocks = kBlockRate / 4;
 
 void Process(
     const Codec::Event* events,
     const Codec::Frame* in,
     Codec::Frame* out,
     size_t size) {
-#ifdef PROFILE_INTERRUPT
-  ScopedDebugPinToggler toggler;
-#endif  // PROFILE_INTERRUPT
-  FloatFrame float_in[kMaxCodecBlockSize];
-  FloatFrame float_out[kMaxCodecBlockSize];
-  bool freeze[kMaxCodecBlockSize];
-  GateFlags seed[kMaxCodecBlockSize];
-
-
-  // Normalization detection.
   normalization_detector.Process(
-      events[size - 1],
-      in[size - 1],
-      cv_reader.cv_values());
-  
-  // CV Reading
+      events[size - 1], in[size - 1], cv_reader.cv_values());
   cv_reader.Read();
-  for (int i = 0; i < Ui::MIX_PARAMETER_LAST; ++i) {
-    ui.ProcessPot(
-        Ui::MixParameter(i),
-        cv_reader.pot(PotsAdcChannel(POTS_ADC_CHANNEL_FEEDBACK + i)));
-  }
-  
-  // Conversion of events into the right format.
-  bool freeze_block = false;
+  const NormalizationDetector& nd = normalization_detector;
+
+  bool freeze_gate = false;
   for (size_t i = 0; i < size; ++i) {
-    freeze[i] = ui.freeze_button_state() || (events[i] & Codec::EVENT_FREEZE);
-    freeze_block |= freeze[i];
+    freeze_gate |= (events[i] & Codec::EVENT_FREEZE) != 0;
   }
-  ui.set_freeze_led_state(freeze_block);
-  
-  bool seed_block = false;
-  GateFlags* seed_input = NULL;
-  if (!normalization_detector.normalized(NORMALIZATION_DETECTOR_CHANNEL_SEED)) {
+  frozen = freeze_latched || freeze_gate;
+
+  // The SEED jack carries the probe when unpatched, so its gate counts only
+  // when something is plugged in.
+  bool reverse_gate = false;
+  if (!nd.normalized(NORMALIZATION_DETECTOR_CHANNEL_SEED)) {
     for (size_t i = 0; i < size; ++i) {
-      event_delay.Write(events[i]);
-      // Delay the seed input by 2.5ms.
-      Codec::Event delayed_event = event_delay.Read(size * 10);
-      bool has_seed = delayed_event & Codec::EVENT_SEED;
-      previous_seed = seed[i] = ExtractGateFlags(previous_seed, has_seed);
-      seed_block |= has_seed;
+      reverse_gate |= (events[i] & Codec::EVENT_SEED) != 0;
     }
-    seed_input = seed;
+  }
+  reversed = reverse_latched || reverse_gate;
+
+  RandomizedParameter p;
+  p.base = cv_reader.pot(POTS_ADC_CHANNEL_TIME);
+  p.attenuverter = cv_reader.pot(POTS_ADC_CHANNEL_TIME_AMOUNT);
+  p.has_cv = !nd.normalized(NORMALIZATION_DETECTOR_CHANNEL_TIME_CV);
+  p.cv = cv_reader.cv(CV_ADC_CHANNEL_TIME);
+  predelay_target = p.value(&time_walk, size, 1.0f, true);
+
+  p.base = cv_reader.pot(POTS_ADC_CHANNEL_SIZE);
+  p.attenuverter = cv_reader.pot(POTS_ADC_CHANNEL_SIZE_AMOUNT);
+  p.has_cv = !nd.normalized(NORMALIZATION_DETECTOR_CHANNEL_SIZE_CV);
+  p.cv = cv_reader.cv(CV_ADC_CHANNEL_SIZE);
+  size_target = p.value(&size_walk, size, 1.0f, true);
+
+  p.base = cv_reader.pot(POTS_ADC_CHANNEL_SHAPE);
+  p.attenuverter = cv_reader.pot(POTS_ADC_CHANNEL_SHAPE_AMOUNT);
+  p.has_cv = !nd.normalized(NORMALIZATION_DETECTOR_CHANNEL_SHAPE_CV);
+  p.cv = cv_reader.cv(CV_ADC_CHANNEL_SHAPE);
+  tone_target = p.value(&shape_walk, size, 1.0f, true);
+
+  // PITCH pot is already in semitones (LAW_DETUNE) and the CV reads in
+  // semitones, so the attenuverter fully clockwise is 1 V/oct. The random
+  // walk spans the reverb's ±12 (Beads' own spans its ±24); the reverb
+  // clamps the sum to ±12.
+  p.base = cv_reader.pot(POTS_ADC_CHANNEL_PITCH);
+  p.attenuverter = cv_reader.pot(POTS_ADC_CHANNEL_PITCH_AMOUNT);
+  p.has_cv = !nd.normalized(NORMALIZATION_DETECTOR_CHANNEL_PITCH_CV);
+  p.cv = cv_reader.cv(CV_ADC_CHANNEL_PITCH);
+  if (!p.has_cv && p.attenuverter > 0.0f) {
+    pitch_target = p.base + octave_jumps.Process(p.attenuverter, p.base, size);
   } else {
-    previous_seed = GATE_FLAG_LOW;
-  }
-  ui.set_seed_led_state(seed_block && !codec_transition_frames);
-  ui.set_overwrite_reserve(synth_mode ? 1.0f : processor.overwrite_reserve());
-  
-  // Conversion of input samples into floats, (with automatic gain control).
-  gain_control.Process(
-      !codec_transition_frames,
-      settings.state().gain,
-      normalization_detector.normalized(
-          NORMALIZATION_DETECTOR_CHANNEL_AUDIO_LEFT),
-      normalization_detector.normalized(
-          NORMALIZATION_DETECTOR_CHANNEL_AUDIO_RIGHT),
-      in,
-      float_in,
-      size);
-  if (codec_transition_frames) {
-    --codec_transition_frames;
-    Codec::Frame silence;
-    silence.l = 0;
-    silence.r = 0;
-    fill(&out[0], &out[size], silence);
-    return;
-  }
-  
-  Parameters p;
-  p.time.base = cv_reader.pot(POTS_ADC_CHANNEL_TIME);
-  p.time.attenuverter = cv_reader.pot(POTS_ADC_CHANNEL_TIME_AMOUNT);
-  p.time.has_cv = !normalization_detector.normalized(
-      NORMALIZATION_DETECTOR_CHANNEL_TIME_CV);
-  p.time.cv = cv_reader.cv(CV_ADC_CHANNEL_TIME);
-  
-  p.size.base = cv_reader.pot(POTS_ADC_CHANNEL_SIZE);
-  p.size.attenuverter = cv_reader.pot(POTS_ADC_CHANNEL_SIZE_AMOUNT);
-  p.size.has_cv = !normalization_detector.normalized(
-      NORMALIZATION_DETECTOR_CHANNEL_SIZE_CV);
-  p.size.cv = cv_reader.cv(CV_ADC_CHANNEL_SIZE);
-
-  p.shape.base = cv_reader.pot(POTS_ADC_CHANNEL_SHAPE);
-  p.shape.attenuverter = cv_reader.pot(POTS_ADC_CHANNEL_SHAPE_AMOUNT);
-  p.shape.has_cv = !normalization_detector.normalized(
-      NORMALIZATION_DETECTOR_CHANNEL_SHAPE_CV);
-  p.shape.cv = cv_reader.cv(CV_ADC_CHANNEL_SHAPE);
-  
-  p.pitch.base = cv_reader.pot(POTS_ADC_CHANNEL_PITCH);
-  p.pitch.attenuverter = cv_reader.pot(POTS_ADC_CHANNEL_PITCH_AMOUNT);
-  p.pitch.has_cv = !normalization_detector.normalized(
-      NORMALIZATION_DETECTOR_CHANNEL_PITCH_CV);
-  p.pitch.cv = cv_reader.cv(CV_ADC_CHANNEL_PITCH);
-  
-#ifdef ENABLE_ADVANCED_FEATURES
-  p.monophonic_mode = settings.state().monophonic_mode;
-#else
-  p.monophonic_mode = false;
-#endif  // ENABLE_ADVANCED_FEATURES
-
-  ModulatedParameter d;
-  d.base = cv_reader.pot(POTS_ADC_CHANNEL_DENSITY);
-  d.cv = cv_reader.cv(CV_ADC_CHANNEL_DENSITY);
-  if (normalization_detector.normalized(
-      NORMALIZATION_DETECTOR_CHANNEL_DENSITY_CV)) {
-    // Avoid small but annoying modulation due to noise on the density
-    // CV input.
-    d.cv = 0.0f;
+    octave_jumps.Process(0.0f, p.base, size);
+    pitch_target = p.value(&pitch_walk, size, 12.0f, false);
   }
 
-  float mix_parameter[Ui::MIX_PARAMETER_LAST];
-  for (int i = 0; i < Ui::MIX_PARAMETER_LAST; ++i) {
-    float base = ui.mix_parameter(Ui::MixParameter(i)) * 1.005f;
-    float amount = settings.state().assignable_cv_destination == 3
-        ? float(settings.state().assignable_cv_amount[i]) / 256.0f
-        : (settings.state().assignable_cv_destination == i ? 1.0f : 0.0f);
-    mix_parameter[i] = base + \
-        (cv_reader.cv(CV_ADC_CHANNEL_ASSIGN) - 0.002f) * amount;
-    CONSTRAIN(mix_parameter[i], 0.0f, 1.0f);
+  // As on Beads, an unpatched DENSITY input is ignored (it carries the probe).
+  float density = cv_reader.pot(POTS_ADC_CHANNEL_DENSITY);
+  if (!nd.normalized(NORMALIZATION_DETECTOR_CHANNEL_DENSITY_CV)) {
+    density += cv_reader.cv(CV_ADC_CHANNEL_DENSITY);
+  }
+  CONSTRAIN(density, 0.0f, 1.0f);
+  density_target = density;
+  pitch_mix_target = cv_reader.pot(POTS_ADC_CHANNEL_REVERB);
+
+  // FEEDBACK knob -> the selection's amount, once the knob has moved from
+  // where it was when it was picked (or everything was reset).
+  static uint32_t fx_seen_seq = 0xffffffff;
+  static float fx_knob_ref = 0.0f;
+  static bool fx_knob_engaged = false;
+  const float fx_knob = cv_reader.pot(POTS_ADC_CHANNEL_FEEDBACK);
+  if (fx_select_seq != fx_seen_seq) {
+    fx_seen_seq = fx_select_seq;
+    fx_knob_ref = fx_knob;
+    fx_knob_engaged = false;
+  }
+  if (!fx_knob_engaged && fabsf(fx_knob - fx_knob_ref) > 0.02f) {
+    fx_knob_engaged = true;
+  }
+  if (fx_knob_engaged) {
+    fx_amount[fx_selected] = std::min(std::max(fx_knob, 0.0f), 1.0f);
+  }
+  velvet_reverb_set_modulation(fx_amount[kFxModulation]);
+  for (int i = 0; i < WET_FX_COUNT; ++i) {
+    wet_fx_set_amount(i, fx_amount[1 + i]);
   }
 
-  Processor::MixParameters m;
-  m.feedback = mix_parameter[Ui::MIX_PARAMETER_FEEDBACK];
-  m.dry_wet = mix_parameter[Ui::MIX_PARAMETER_DRY_WET];
-  m.reverb_amount = mix_parameter[Ui::MIX_PARAMETER_REVERB];
-  m.output_gate = settings.state().gate_output_mode;
+  // An unpatched audio input carries the probe: take the other side in its
+  // place, or silence with neither patched, as Beads' GainControl does.
+  const bool l_open = nd.normalized(NORMALIZATION_DETECTOR_CHANNEL_AUDIO_LEFT);
+  const bool r_open = nd.normalized(NORMALIZATION_DETECTOR_CHANNEL_AUDIO_RIGHT);
+  const bool mute = startup_mute_blocks > 0;
+  if (mute) --startup_mute_blocks;
 
-  SeedButtonState seed_button_state = ui.seed_button_locked()
-      ? SEED_BUTTON_STATE_LOCKED
-      : (ui.seed_button_state() ? SEED_BUTTON_STATE_ON : SEED_BUTTON_STATE_OFF);
-  
-  if (ui.trim_flag()) {
-    processor.Trim();
-    ui.ClearTrimFlag();
-  }
-  if (synth_mode) {
-    synth.Render(
-        seed_button_state,
-        seed_input,
-        freeze,
-        Synth::Resolution(settings.state().media),
-        d, p, m,
-        float_out, size);
-  } else {
-    processor.Process(
-        seed_button_state,
-        seed_input,
-        freeze,
-        d, p, m,
-        float_in,
-        float_out, size);
-  }
-  
-  // Conversion of output samples into integers.
+  const float send = send_gain;
+  const float dry = dry_gain;
+  float peak = input_peak;
+
   for (size_t i = 0; i < size; ++i) {
-    float l = float_out[i].l;
-    float r = float_out[i].r;
-    CONSTRAIN(l, -1.0f, 0.999999f);
-    CONSTRAIN(r, -1.0f, 0.999999f);
-    if (fabsf(l) > 0.01f || fabsf(r) > 0.01f) {
-      synth_mode_start_time = 0;
+    // Codec frames are 24-bit audio in 32-bit slots; the reverb works in
+    // int16 like the DLD, so feed it the top 16 bits of the mono sum.
+    float l = static_cast<float>(in[i].l) * (1.0f / 2147483648.0f);
+    float r = static_cast<float>(in[i].r) * (1.0f / 2147483648.0f);
+    if (mute || (l_open && r_open)) {
+      l = r = 0.0f;
+    } else if (l_open) {
+      l = r;
+    } else if (r_open) {
+      r = l;
     }
-    out[i].l = static_cast<int32_t>(l * 2147483648.0f);
-    out[i].r = static_cast<int32_t>(r * 2147483648.0f);
+    const float mono = 0.5f * (l + r);
+    peak = std::max(peak, fabsf(mono));
+
+    velvet_reverb_push_sample(SaturateInt16(mono * send * 32768.0f));
+    float out_l = l * dry + velvet_reverb_out_left() * (1.0f / 32768.0f);
+    float out_r = r * dry + velvet_reverb_out_right() * (1.0f / 32768.0f);
+    CONSTRAIN(out_l, -1.0f, 0.999999f);
+    CONSTRAIN(out_r, -1.0f, 0.999999f);
+    out[i].l = static_cast<int32_t>(out_l * 2147483648.0f);
+    out[i].r = static_cast<int32_t>(out_r * 2147483648.0f);
   }
+  input_peak = peak;
 }
 
-void ConfigureAndStartCodec(bool new_synth_mode, bool reset_gain_control) {
-  int sr = new_synth_mode ? 48000 : int(processor.sample_rate());
-  synth_mode = new_synth_mode;
-  synth_mode_start_time = 0;
-
-  gain_control.Init(
-      float(sr),
-      processor.media() == Processor::MEDIA_DIRTY_TAPE
-          ? GainControl::SOFT_CLIPPING_MODE_ON
-          : (processor.media() == Processor::MEDIA_CLEAN_TAPE
-                ? GainControl::SOFT_CLIPPING_MODE_DYNAMIC
-                : GainControl::SOFT_CLIPPING_MODE_OFF),
-      reset_gain_control);
-  normalization_detector.Init(sr == 48000 ? 2 : (sr == 32000 ? 3 : 4));
-  event_delay.Init();
-
-  codec_transition_frames = kBlockRate / 4;
-  codec.Start(sr, sr / kBlockRate, &Process);
+// DRY/WET pot -> send and dry gain, as on the DLD's right MIX pot: the send
+// follows an equal-power curve, and the last 10% of travel fades the dry path
+// out so the end of the knob is 100% reverb.
+void UpdateMix() {
+  const float t = cv_reader.pot(POTS_ADC_CHANNEL_DRY_WET);
+  send_gain = sinf(std::min(std::max(t, 0.0f), 1.0f) * 1.5707963f);
+  const float fade_start = 0.9f;
+  dry_gain = t <= fade_start ? 1.0f : std::max(0.0f, (1.0f - t) / (1.0f - fade_start));
 }
 
 void Init() {
@@ -298,112 +403,50 @@ void Init() {
   sys.Init(true);
 
   Watchdog::Start();
+  codec.Init();
+  leds.Init();
+  switches.Init();
   freeze_input.Init();
   seed_input.Init();
-  codec.Init();
 
+  // Read the factory CV calibration. Nothing here ever writes settings back.
+  settings.Init(false);
   cv_reader.Init(&settings);
-  calibrator.Init(&settings, &cv_reader, &normalization_detector);
-  
-  uint8_t* delay_buffers[3];
-  delay_buffers[0] = delay_buffer_1;
-  delay_buffers[1] = delay_buffer_1 + (256 * 1024);
-  delay_buffers[2] = delay_buffer_2;
-  
-  processor.Init(delay_buffers, reverb_buffer);
-  synth.Init(reverb_buffer);
-  background_buffer_backup.Init(&processor, &settings);
+  // Prescaler 2 at 48 kHz, as Beads sets it.
+  normalization_detector.Init(2);
+  time_walk.Init(kWalkFrequency);
+  size_walk.Init(kWalkFrequency);
+  shape_walk.Init(kWalkFrequency);
+  pitch_walk.Init(kWalkFrequency);
+  octave_jumps.Init();
 
-  ui.Init(&settings, &gain_control, &calibrator, &background_buffer_backup);
-  
-  factory_test.Init(
-      &cv_reader,
-      &normalization_detector,
-      &calibrator,
-      &ui.switches());
-  
-  gain_control.Init(48000.0f, GainControl::SOFT_CLIPPING_MODE_OFF, true);
+  wet_fx_init(float(kSampleRate));
+  memset(beads_t2_ring_storage, 0, sizeof(beads_t2_ring_storage));
+  memset(beads_predelay_a_storage, 0, sizeof(beads_predelay_a_storage));
+  memset(beads_predelay_b_storage, 0, sizeof(beads_predelay_b_storage));
+  velvet_reverb_init();
 
-  const bool recovery_mode = ui.pressed_immediate(SWITCH_SEED);
-  const bool freshly_baked = !settings.Init(recovery_mode);
-  if (freshly_baked && !skip_factory_test) {
-    factory_test.Start();
-    ui.set_factory_test(true);
-    normalization_detector.Init(2);
-    codec.Start(48000, 48000 / kBlockRate, &FactoryTest::ProcessFn);
-  } else {
-#ifdef PROFILE_INTERRUPT
-    DebugPin::Init();
-#endif  // PROFILE_INTERRUPT
-    ui.set_factory_test(false);
-    synth_mode_start_time = 0;
-    synth_mode = true;
-  }
   ready = true;
-  
-  bool was_frozen = background_buffer_backup.Load();
-  if (was_frozen) {
-    ui.set_freeze_button_state(was_frozen);
-    ConfigureAndStartCodec(false, true);
-  }
-}
-
-void MonitorStateChange() {
-  if (ui.should_ignore_state_change() || codec_transition_frames) {
-    synth_mode_start_time = 0;
-    return;
-  }
-  
-  if (normalization_detector.no_input()) {
-    if (!synth_mode) {
-      if (!synth_mode_start_time) {
-        synth_mode_start_time = system_clock.milliseconds();
-        if (!synth_mode_start_time) synth_mode_start_time = 1;
-      } else {
-        if ((system_clock.milliseconds() - synth_mode_start_time) >= 10000) {
-          // If 10 seconds have elapsed with nothing patched in the audio
-          // inputs, enable the synth mode.
-          codec.Stop();
-          ConfigureAndStartCodec(true, true);
-        }
-      }
-    }
-  } else {
-    // Awful block of code to troubleshoot glitches related to changes of
-    // sample rate and more general codec settings.
-    //
-    // static uint32_t elapsed = 0;
-    // bool autoreset = (system_clock.milliseconds() - elapsed) >= 400;
-    // if (autoreset) {
-    //   settings.mutable_state()->media = 
-    //       (settings.mutable_state()->media + 1) % 4;
-    // }
-
-    Processor::Media media = Processor::Media(settings.state().media);
-    bool mono = normalization_detector.mono();
-    bool media_changed = media != processor.media();
-    bool mono_changed = mono != processor.mono();
-    
-    if (synth_mode || mono_changed || media_changed) {
-      // elapsed = system_clock.milliseconds();
-      codec.Stop();
-      processor.Configure(media, mono);
-      ConfigureAndStartCodec(false, mono_changed || synth_mode);
-    }
-    synth_mode_start_time = 0;
-  }
+  codec.Start(kSampleRate, kSampleRate / kBlockRate, &Process);
 }
 
 int main(void) {
   Init();
 
   while (1) {
-    ui.DoEvents();
-    MonitorStateChange();
-    if (!synth_mode) {
-      background_buffer_backup.Process(ui.freeze_led_state());
-    }
-    processor.WasteCPUCycles(16);
+    // The macro setters only store a target (with a dead-band); the reverb
+    // picks the change up inside poll, so calling them every pass is cheap.
+    const float size_macro = powf(size_target, kSizeLaw);
+    velvet_reverb_apply_decay_macro(size_macro);
+    velvet_reverb_apply_size_macro(size_macro);
+    velvet_reverb_set_input_delay(predelay_target);
+    velvet_reverb_apply_tone_macro(tone_target);
+    velvet_reverb_apply_density_macro(density_target);
+    velvet_reverb_set_pitch(pitch_target);
+    velvet_reverb_set_pitch_mix(pitch_mix_target);
+    velvet_reverb_set_freeze(frozen);
+    velvet_reverb_set_reverse(reversed);
+    UpdateMix();
+    velvet_reverb_poll();
   }
 }
-

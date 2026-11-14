@@ -41,11 +41,16 @@ TARGET         = beads
 PACKAGES       = beads \
 		beads/drivers \
 		beads/dsp \
+		beads/velvet \
 		stmlib/dsp \
 		stmlib/utils \
 		stmlib/ui \
 		stmlib/system
 RESOURCES      = beads/resources
+
+# Velvet reverb: Beads platform path, 24 kHz internal rate (the 48 kHz build
+# needs 1.36 MiB and does not fit), no DMA prefetch (all buffers are internal).
+PROJECT_CONFIGURATION = -DVELVET_REVERB_BEADS=1 -DREVERB_FS_HZ=24000
 
 # Also tested with latest gcc version (8.3.1). Improvement of code size, no
 # improvement of CPU use, much longer compile time.
@@ -55,6 +60,11 @@ OPENOCD_SCRIPT_PATH ?= /usr/local/openocd/0.10.0-13/scripts/
 GOLDEN_FIRMWARE = beads/hardware_design/golden_firmware/beads_golden_bootloader_combo.bin
 
 include stmlib/makefile.inc
+
+# The STM32H7 HAL headers use 'register', which C++17 (the default in current
+# GCC) rejects. Recipes expand CPPFLAGS lazily, so this overrides the
+# stmlib value.
+CPPFLAGS = -fno-exceptions -fno-rtti -std=gnu++14
 
 # Rule for building the firmware update file
 wav:  $(TARGET_BIN)
