@@ -368,8 +368,14 @@ float reverb_t2_duration_s_target = 3.217f;    /* driven by Size  */
  * high-shelf Hz. Fixed (no macro maps them): delay times, low-shelf, high-shelf
  * dB, fb-mod, duck. All values from the user's slider snapshot. */
 float reverb_feedback         = 0.969f;  /* driven by Decay */
+/* The two loops' lengths are in the golden ratio, the most irrational of
+ * ratios, so their echoes never fall back into step. (The DLD's 0.185 / 0.3 s
+ * is 60/37, within 0.2% of it, but rational: the two lined up again every
+ * 11.1 s, 37 passes of one against 60 of the other.) B is 299.34 ms, not a
+ * whole number of samples, so even the sample grid never repeats them. */
+#define LOOP_GOLDEN_RATIO  1.6180340f
 float reverb_predelay_a_s      = 0.185f;
-float reverb_predelay_b_s      = 0.300f;
+float reverb_predelay_b_s      = 0.185f * LOOP_GOLDEN_RATIO;
 float reverb_delay_mix         = 0.68f;   /* fixed: the DLD's at the default Decay */
 float reverb_fb_low_shelf_hz   = 124.0f;  /* fixed */
 float reverb_fb_low_shelf_db   = -0.6f;   /* fixed; unused with decay-matched shelves */
