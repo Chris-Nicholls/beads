@@ -4831,6 +4831,11 @@ void velvet_reverb_poll(void)
  * reader thus reads slot (rd_seq % NBUF): always a completed block, never the
  * writer's in-progress slot. */
 uint32_t velvet_reverb_blocks_done(void) { return blocks_produced; }
+void velvet_reverb_overruns(uint32_t *drops, uint32_t *misses)
+{
+    *drops = input_drop_count;
+    *misses = output_miss_count;
+}
 
 int16_t velvet_reverb_out_left(void)
 {

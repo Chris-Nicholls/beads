@@ -279,6 +279,10 @@ void velvet_reverb_push_sample(int16_t input);            /* mono: both channels
 void velvet_reverb_push_stereo(int16_t left, int16_t right);
 /* Output blocks completed so far (a count that only grows). */
 uint32_t velvet_reverb_blocks_done(void);
+/* Running counts of the reverb falling behind: input blocks dropped because
+ * the main loop had not taken the last ones, and output blocks replayed
+ * because none was ready. Both stay 0 while it keeps up. */
+void velvet_reverb_overruns(uint32_t *drops, uint32_t *misses);
 int16_t velvet_reverb_out_left(void);
 int16_t velvet_reverb_out_right(void);
 

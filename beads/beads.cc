@@ -109,7 +109,9 @@ int16_t beads_input_delay_r_storage[INPUT_DELAY_SAMPLES] __attribute__ ((section
 // beads_cpu in build/beads/beads.map). Shares of the CPU in tenths of a
 // percent: the reverb's processing in the main loop, the audio interrupt,
 // their sum, and the busiest single reverb block as a share of the block's
-// 0.5 ms (a block that takes longer than that is late).
+// time (16 samples at 24 kHz, 667 us). Then the reverb's running counts of
+// falling behind (input blocks dropped, output blocks replayed): any
+// nonzero count is audible.
 struct BeadsCpu {
   uint32_t magic;           // 0xC0FFEE01 once the first second is in
   uint32_t reverb_permille;
@@ -117,8 +119,10 @@ struct BeadsCpu {
   uint32_t total_permille;
   uint32_t peak_block_permille;
   uint32_t seconds;
+  uint32_t input_drops;
+  uint32_t output_misses;
 };
-volatile BeadsCpu beads_cpu __attribute__ ((used)) = { 0, 0, 0, 0, 0, 0 };
+volatile BeadsCpu beads_cpu __attribute__ ((used)) = { 0, 0, 0, 0, 0, 0, 0, 0 };
 volatile uint32_t audio_cycles = 0;   // audio interrupt cycles, running total
 
 Codec codec;
@@ -485,13 +489,16 @@ void PollAndMeasure() {
   if (window >= SystemCoreClock) {
     const uint32_t audio = audio_cycles - audio_at_start;
     const float per = 1000.0f / float(window);
-    // One reverb block is 12 samples at 24 kHz: 0.5 ms.
-    const float block_cycles = float(SystemCoreClock) * 0.0005f;
+    const float block_cycles = float(SystemCoreClock) * float(REVERB_BLOCK) / float(REVERB_FS_HZ);
     beads_cpu.reverb_permille = uint32_t(float(reverb_cycles) * per);
     beads_cpu.audio_permille = uint32_t(float(audio) * per);
     beads_cpu.total_permille = beads_cpu.reverb_permille + beads_cpu.audio_permille;
     beads_cpu.peak_block_permille = uint32_t(float(peak_cycles) * 1000.0f / block_cycles);
     beads_cpu.seconds = beads_cpu.seconds + 1;
+    uint32_t drops, misses;
+    velvet_reverb_overruns(&drops, &misses);
+    beads_cpu.input_drops = drops;
+    beads_cpu.output_misses = misses;
     beads_cpu.magic = 0xC0FFEE01u;
     window_start = DWT->CYCCNT;
     reverb_cycles = 0;
