@@ -1934,6 +1934,11 @@ void velvet_reverb_regenerate_taps(void)
 #define FADE_WINDOW_FRAC  0.06f
 
 /* ==== Init ==== */
+/* The sustain loops' drift LFOs (see loop_drift_step). */
+static uint32_t loop_lfo_ph[4];
+static float loop_lfo_rw[4], loop_lfo[4];
+static uint32_t loop_lfo_seed = 0x2545F491u;
+
 void velvet_reverb_init(void)
 {
     /* Apply default macro positions so the reverb_* targets reflect the
@@ -2022,6 +2027,15 @@ void velvet_reverb_init(void)
     memset(&pre_rd_b, 0, sizeof pre_rd_b);
     memset(&pre_rd_a_r, 0, sizeof pre_rd_a_r);
     memset(&pre_rd_b_r, 0, sizeof pre_rd_b_r);
+    {
+        static const float ph0[4] = { 0.1f, 0.45f, 0.7f, 1.3f };   /* Cosmos's starting phases */
+        for (int j = 0; j < 4; j++) {
+            loop_lfo_ph[j] = (uint32_t)(ph0[j] * 2147483648.0f);
+            loop_lfo_rw[j] = 0.0f;
+            loop_lfo[j] = ph0[j] < 1.0f ? ph0[j] : 2.0f - ph0[j];
+        }
+        loop_lfo_seed = 0x2545F491u;
+    }
     duck_env = 0.0f;
     pre_low_shelf_a.z1 = pre_low_shelf_a.z2 = 0.0f;
     pre_high_shelf_a.z1 = pre_high_shelf_a.z2 = 0.0f;
@@ -3165,16 +3179,40 @@ static void pd_init(void)
 #endif
 }
 
-/* One line's loop for a whole block: modulated fractional read, shelves, DC
- * block, node. The same arithmetic in the same order as when the two lines were
- * interleaved per sample (nothing couples them inside a sample except the shared
- * duck, computed beforehand), so the output is unchanged. The read state is
- * worked on in a local copy so it can stay in registers: through the pointer,
- * every store to node[] could alias it. */
+/* The two loops on each side, after the Cosmos engine's family A: each
+ * loop's feedback reads a share of the other loop (LOOP_BLUR), so an echo of
+ * one comes round again at the other's length, and on, and the repeats
+ * multiply. And the two loops' shares of the feed drift on slow random-walk
+ * LFOs (LOOP_DRIFT), differently on each side.
+ *
+ * Cosmos's blend (own 1 - 0.49 blur, other 0.51 blur) keeps the level of
+ * what the two loops share but loses that of what they don't, ~2 dB a pass
+ * at 0.5, which its Regen (up to 1.066) makes back with a limiter behind it.
+ * Here the blend is the rotation with the same shares (cos, sin), which
+ * keeps every signal's level, so the feedback Size sets stays the decay.
+ * Frozen, each line copies its own raw read, so a frozen loop holds exactly.
+ *
+ * With one gain per pass the shorter loop (A) went round more often and so
+ * died sooner, and the blur pulled the longer loop's energy into it and
+ * shortened the tail; so each loop's gain is Size's raised to its length
+ * over LOOP_T60_REF_S (and its shelves' dB scaled the same), which keeps the
+ * two decaying at one rate per second. */
+#ifndef LOOP_BLUR
+#define LOOP_BLUR    0.5f
+#endif
+#ifndef LOOP_DRIFT
+#define LOOP_DRIFT   0.35f
+#endif
+#ifndef LOOP_T60_REF_S
+#define LOOP_T60_REF_S   0.27f
+#endif
+
+/* One line's read for a whole block: modulated fractional read (and the
+ * crossfade when its length steps). The read state is worked on in a local
+ * copy so it can stay in registers. */
 __attribute__((always_inline)) static inline
-void pd_line_pass(float *phase, PdReadState *rd, Biquad *lsh, Biquad *hsh, float *hp,
-                  const float *line, float wbase, PdLen *len,
-                  float modDepth, float modInc, const float *px, float *node)
+void pd_line_read(float *phase, PdReadState *rd, const float *line, float wbase, PdLen *len,
+                  float modDepth, float modInc, float *r_out)
 {
     PdReadState rs = *rd;
     float time = len->time;
@@ -3191,9 +3229,27 @@ void pd_line_pass(float *phase, PdReadState *rd, Biquad *lsh, Biquad *hsh, float
             r += t * t * (3.0f - 2.0f * t) * (r2 - r);
             if (--left == 0) { time = len->to; rs = len->rs; }
         }
-        float rf = biquad_process(hsh, biquad_process(lsh, r));
+        r_out[n] = r;
+    }
+    *rd = rs;
+    len->time = time;
+    len->left = left;
+}
+
+/* One line's node for a whole block from its own read and the other loop's
+ * (the blur): shelves, DC block, feedback, input. */
+__attribute__((always_inline)) static inline
+void pd_line_node(Biquad *lsh, Biquad *hsh, float *hp, const float *own, const float *other,
+                  float otherSign, const float *px, float fbScale, float *node)
+{
+    const float o = 1.0f - 0.49f * LOOP_BLUR, t = 0.51f * LOOP_BLUR;
+    const float norm = 1.0f / sqrtf(o * o + t * t);
+    const float kOwn = o * norm, kOther = otherSign * t * norm;   /* cos, +-sin */
+    for (int n = 0; n < REVERB_BLOCK; n++) {
+        const float r = own[n];
+        float rf = biquad_process(hsh, biquad_process(lsh, kOwn * r + kOther * other[n]));
         *hp += pre_hp_coeff * (rf - *hp);
-        float nd = px[n] + pd_fbeff[n] * (rf - *hp);
+        float nd = px[n] + fbScale * pd_fbeff[n] * (rf - *hp);
         nd += pd_frz[n] * (r - nd);              /* frozen: the raw read, unity gain */
 #ifdef VELVET_REVERB_HOST
         { float m = nd < 0.0f ? -nd : nd;
@@ -3203,9 +3259,22 @@ void pd_line_pass(float *phase, PdReadState *rd, Biquad *lsh, Biquad *hsh, float
         if (nd > 4.0f) nd = 4.0f; else if (nd < -4.0f) nd = -4.0f;
         node[n] = nd;
     }
-    *rd = rs;
-    len->time = time;
-    len->left = left;
+}
+
+/* The drift: four slow triangle LFOs (0..1) whose rates wander, as Cosmos's
+ * (a ~13 s cycle, +-50%). Advanced once a block. */
+static void loop_drift_step(void)
+{
+    static const float rate[4] = { 6.230e-6f, 7.533e-6f, 4.632e-6f, 5.933e-6f };   /* per sample at 24 kHz */
+    for (int j = 0; j < 4; j++) {
+        uint32_t x = loop_lfo_seed; x ^= x << 13; x ^= x >> 17; x ^= x << 5; loop_lfo_seed = x;
+        const float rnd = (float)x * 2.3283064e-10f - 0.5f;
+        float rw = loop_lfo_rw[j] + rnd * 7e-4f;
+        loop_lfo_rw[j] = rw < -0.5f ? -0.5f : rw > 0.5f ? 0.5f : rw;
+        loop_lfo_ph[j] += (uint32_t)(rate[j] * (loop_lfo_rw[j] + 1.0f) * (float)REVERB_BLOCK * 2147483648.0f);
+        const float ph = (float)loop_lfo_ph[j] * (1.0f / 2147483648.0f);
+        loop_lfo[j] = ph < 1.0f ? ph : 2.0f - ph;
+    }
 }
 
 /* Starts a step to a new loop length when one is due (see PdLen). */
@@ -3495,11 +3564,12 @@ typedef struct {
 
 static void pd_mix(const PdMix *pm, const float *pdpx, const float *idout,
                    const float *na, const float *nb, const float *oa, const float *ob,
-                   const float *ra, const float *rb, float *out)
+                   const float *ra, const float *rb, float drift, float *out)
 {
     const float to_unit = 1.0f / 32768.0f;
     const float invBlock = 1.0f / (float)REVERB_BLOCK;
-    const float mix = pm->mix, wA = pm->wA, wB = pm->wB;
+    /* The drift moves the balance between the loops; their sum holds. */
+    const float mix = pm->mix, wA = pm->wA * (1.0f + drift), wB = pm->wB * (1.0f - drift);
     for (int n = 0; n < REVERB_BLOCK; n++) {
         float px = pdpx[n];
         const float fz = pd_frz[n];
@@ -3590,12 +3660,18 @@ static void do_predelay(void)
 #if REVERB_LOOP_T60_SHELVES
     if (reverb_t60_shelves_on) { ls_db = t60_ls_db; hs_db = t60_hs_db; }
 #endif
-    /* Shared shelf coeffs — recompute (for all four lines) only on change. */
+    /* Each loop's gain and shelves at its length over LOOP_T60_REF_S. */
+    const float tRef = LOOP_T60_REF_S * (float)REVERB_FS_HZ;
+    const float abRatio = timeA / tRef, bbRatio = timeB / tRef;
+    const float fbScaleA = (fb > 1e-6f) ? powf(fb, abRatio - 1.0f) : 1.0f;   /* fb^r / fb */
+    const float fbScaleB = (fb > 1e-6f) ? powf(fb, bbRatio - 1.0f) : 1.0f;
+    /* Shelf coeffs, recomputed only on change: A's for both A lines, B's for
+     * both B lines. */
     if (reverb_fb_low_shelf_hz != last_fb_ls_hz || ls_db != last_fb_ls_db) {
-        biquad_lowshelf(&pre_low_shelf_a, reverb_fb_low_shelf_hz, ls_db, (float)REVERB_FS_HZ);
-        biquad_copy_coeffs(&pre_low_shelf_b, &pre_low_shelf_a);
+        biquad_lowshelf(&pre_low_shelf_a, reverb_fb_low_shelf_hz, ls_db * abRatio, (float)REVERB_FS_HZ);
+        biquad_lowshelf(&pre_low_shelf_b, reverb_fb_low_shelf_hz, ls_db * bbRatio, (float)REVERB_FS_HZ);
         biquad_copy_coeffs(&pre_low_shelf_a_r, &pre_low_shelf_a);
-        biquad_copy_coeffs(&pre_low_shelf_b_r, &pre_low_shelf_a);
+        biquad_copy_coeffs(&pre_low_shelf_b_r, &pre_low_shelf_b);
         last_fb_ls_hz = reverb_fb_low_shelf_hz; last_fb_ls_db = ls_db;
     }
     /* Tone-mapped high shelf sits IN the feedback loop, so a raw coeff jump
@@ -3603,10 +3679,10 @@ static void do_predelay(void)
      * (db is fixed, compared directly). */
     if (fabsf(fb_hs_hz_morph - last_fb_hs_hz) > last_fb_hs_hz * 0.0003f ||
         hs_db != last_fb_hs_db) {
-        biquad_highshelf(&pre_high_shelf_a, fb_hs_hz_morph, hs_db, (float)REVERB_FS_HZ);
-        biquad_copy_coeffs(&pre_high_shelf_b, &pre_high_shelf_a);
+        biquad_highshelf(&pre_high_shelf_a, fb_hs_hz_morph, hs_db * abRatio, (float)REVERB_FS_HZ);
+        biquad_highshelf(&pre_high_shelf_b, fb_hs_hz_morph, hs_db * bbRatio, (float)REVERB_FS_HZ);
         biquad_copy_coeffs(&pre_high_shelf_a_r, &pre_high_shelf_a);
-        biquad_copy_coeffs(&pre_high_shelf_b_r, &pre_high_shelf_a);
+        biquad_copy_coeffs(&pre_high_shelf_b_r, &pre_high_shelf_b);
         last_fb_hs_hz = fb_hs_hz_morph; last_fb_hs_db = hs_db;
     }
 
@@ -3740,14 +3816,17 @@ static void do_predelay(void)
     /* Line A, then line B while A's write-back runs. The right channel's
      * lines take the same modulation, from the same starting phases. */
     float phA_r = pre_mod_phase_a, phB_r = pre_mod_phase_b;
-    pd_line_pass(&pre_mod_phase_a, &pre_rd_a, &pre_low_shelf_a, &pre_high_shelf_a, &pre_hp_a,
-                 predelay_a, wbase, &pre_len_a, modDepth, modInc, pd_px, pd_node_a);
-    pd_line_pass(&pre_mod_phase_b, &pre_rd_b, &pre_low_shelf_b, &pre_high_shelf_b, &pre_hp_b,
-                 predelay_b, wbase, &pre_len_b, modDepth, modInc, pd_px, pd_node_b);
-    pd_line_pass(&phA_r, &pre_rd_a_r, &pre_low_shelf_a_r, &pre_high_shelf_a_r, &pre_hp_a_r,
-                 predelay_a_r, wbase, &pre_len_a_r, modDepth, modInc, pd_px_r, pd_node_a_r);
-    pd_line_pass(&phB_r, &pre_rd_b_r, &pre_low_shelf_b_r, &pre_high_shelf_b_r, &pre_hp_b_r,
-                 predelay_b_r, wbase, &pre_len_b_r, modDepth, modInc, pd_px_r, pd_node_b_r);
+    {
+        float rA[REVERB_BLOCK], rB[REVERB_BLOCK], rAr[REVERB_BLOCK], rBr[REVERB_BLOCK];
+        pd_line_read(&pre_mod_phase_a, &pre_rd_a, predelay_a, wbase, &pre_len_a, modDepth, modInc, rA);
+        pd_line_read(&pre_mod_phase_b, &pre_rd_b, predelay_b, wbase, &pre_len_b, modDepth, modInc, rB);
+        pd_line_read(&phA_r, &pre_rd_a_r, predelay_a_r, wbase, &pre_len_a_r, modDepth, modInc, rAr);
+        pd_line_read(&phB_r, &pre_rd_b_r, predelay_b_r, wbase, &pre_len_b_r, modDepth, modInc, rBr);
+        pd_line_node(&pre_low_shelf_a, &pre_high_shelf_a, &pre_hp_a, rA, rB, 1.0f, pd_px, fbScaleA, pd_node_a);
+        pd_line_node(&pre_low_shelf_b, &pre_high_shelf_b, &pre_hp_b, rB, rA, -1.0f, pd_px, fbScaleB, pd_node_b);
+        pd_line_node(&pre_low_shelf_a_r, &pre_high_shelf_a_r, &pre_hp_a_r, rAr, rBr, 1.0f, pd_px_r, fbScaleA, pd_node_a_r);
+        pd_line_node(&pre_low_shelf_b_r, &pre_high_shelf_b_r, &pre_hp_b_r, rBr, rAr, -1.0f, pd_px_r, fbScaleB, pd_node_b_r);
+    }
     /* Cross-feed (STEREO_LOOP_XFEED), held off while frozen so a frozen loop
      * keeps exactly what it holds. */
     for (int n = 0; n < REVERB_BLOCK; n++) {
@@ -3794,8 +3873,11 @@ static void do_predelay(void)
      * both line nodes by mix: this is its total. Frozen, it is fed at that. */
     pm.dryK = 1.0f - mix + mix * (pm.wA + pm.wB);
     pm.oct_run = oct_run; pm.rev_run = rev_run;
-    pd_mix(&pm, pd_px, id_out, pd_node_a, pd_node_b, oct_out_a, oct_out_b, rev_out_a, rev_out_b, predelay_out);
-    pd_mix(&pm, pd_px_r, id_out_r, pd_node_a_r, pd_node_b_r, oct_out_a_r, oct_out_b_r, rev_out_a_r, rev_out_b_r, predelay_out_r);
+    loop_drift_step();
+    pd_mix(&pm, pd_px, id_out, pd_node_a, pd_node_b, oct_out_a, oct_out_b, rev_out_a, rev_out_b,
+           LOOP_DRIFT * (loop_lfo[1] - loop_lfo[0]), predelay_out);
+    pd_mix(&pm, pd_px_r, id_out_r, pd_node_a_r, pd_node_b_r, oct_out_a_r, oct_out_b_r, rev_out_a_r, rev_out_b_r,
+           LOOP_DRIFT * (loop_lfo[3] - loop_lfo[2]), predelay_out_r);
     predelay_wh += REVERB_BLOCK;
     if (predelay_wh >= REVERB_IDX_WRAP) predelay_wh -= REVERB_IDX_WRAP;
 }
