@@ -65,13 +65,19 @@ extern "C" {
 /* On the Beads: T2's span stops at T2_DURATION_MAX_SAMPLES (3.25 s), so the
  * ring is the next power of two, 131072 (5.5 s, 256 KiB of RAM_D1). */
 #define T2_RING_SAMPLES  (131072UL * REVERB_RATE_MULT)
+/* The reverb is stereo throughout: each channel has its own T2 ring, which
+ * that side's taps read. */
 #ifdef VELVET_REVERB_HOST
 extern int16_t host_t2_ring_storage[T2_RING_SAMPLES];
+extern int16_t host_t2_ring_r_storage[T2_RING_SAMPLES];
 #define T2_RING_BASE     ((uintptr_t)host_t2_ring_storage)
+#define T2_RING_R_BASE   ((uintptr_t)host_t2_ring_r_storage)
 #elif defined(VELVET_REVERB_BEADS)
-/* Beads: AXI SRAM (RAM_D1), defined in beads.cc. */
+/* Beads: AXI SRAM (RAM_D1), both rings filling it, defined in beads.cc. */
 extern int16_t beads_t2_ring_storage[T2_RING_SAMPLES];
+extern int16_t beads_t2_ring_r_storage[T2_RING_SAMPLES];
 #define T2_RING_BASE     ((uintptr_t)beads_t2_ring_storage)
+#define T2_RING_R_BASE   ((uintptr_t)beads_t2_ring_r_storage)
 #else
 /* 0xD2000000 = SDRAM_BASE + SDRAM_SIZE (32 MiB SDRAM ends here).
  * T2 ring occupies [0xD2000000 - T2_RING_SAMPLES*2 .. 0xD2000000). */
@@ -102,30 +108,45 @@ extern int16_t beads_t2_ring_storage[T2_RING_SAMPLES];
 
 /* The input delay (the Beads panel's pre-delay): the reverb's input, int16 as
  * it arrives, held back by up to INPUT_DELAY_MAX_S before the sustain loop
- * and the cascade, so the whole reverb comes in later. A power-of-two ring. */
-#define INPUT_DELAY_SAMPLES     (32768UL * REVERB_RATE_MULT)
+ * and the cascade, so the whole reverb comes in later. A power-of-two ring
+ * per channel; the pair fills RAM_D3 on the Beads, which is what sets the
+ * maximum (16384 samples = 0.683 s, less a block). */
+#define INPUT_DELAY_SAMPLES     (16384UL * REVERB_RATE_MULT)
 #define INPUT_DELAY_MASK        (INPUT_DELAY_SAMPLES - 1)
-#define INPUT_DELAY_MAX_S       1.0f
+#define INPUT_DELAY_MAX_S       0.68f
 #ifdef VELVET_REVERB_HOST
 extern int16_t host_input_delay_storage[INPUT_DELAY_SAMPLES];
-#define INPUT_DELAY_BASE  ((uintptr_t)host_input_delay_storage)
+extern int16_t host_input_delay_r_storage[INPUT_DELAY_SAMPLES];
+#define INPUT_DELAY_BASE    ((uintptr_t)host_input_delay_storage)
+#define INPUT_DELAY_R_BASE  ((uintptr_t)host_input_delay_r_storage)
 #elif defined(VELVET_REVERB_BEADS)
 extern int16_t beads_input_delay_storage[INPUT_DELAY_SAMPLES];
-#define INPUT_DELAY_BASE  ((uintptr_t)beads_input_delay_storage)
+extern int16_t beads_input_delay_r_storage[INPUT_DELAY_SAMPLES];
+#define INPUT_DELAY_BASE    ((uintptr_t)beads_input_delay_storage)
+#define INPUT_DELAY_R_BASE  ((uintptr_t)beads_input_delay_r_storage)
 #endif
 #define PRE_MOD_MAX_SAMPLES     (720 * REVERB_RATE_MULT)    /* 0.030 s (depth = 1 swing) */
 
+/* Two loops (A, the shorter, and B), each a pair of lines, left and right. */
 #ifdef VELVET_REVERB_HOST
 extern float host_predelay_a_storage[PRE_DELAY_LINE_SAMPLES];
 extern float host_predelay_b_storage[PRE_DELAY_LINE_SAMPLES];
-#define PRE_DELAY_A_BASE  ((uintptr_t)host_predelay_a_storage)
-#define PRE_DELAY_B_BASE  ((uintptr_t)host_predelay_b_storage)
+extern float host_predelay_a_r_storage[PRE_DELAY_LINE_SAMPLES];
+extern float host_predelay_b_r_storage[PRE_DELAY_LINE_SAMPLES];
+#define PRE_DELAY_A_BASE    ((uintptr_t)host_predelay_a_storage)
+#define PRE_DELAY_B_BASE    ((uintptr_t)host_predelay_b_storage)
+#define PRE_DELAY_A_R_BASE  ((uintptr_t)host_predelay_a_r_storage)
+#define PRE_DELAY_B_R_BASE  ((uintptr_t)host_predelay_b_r_storage)
 #elif defined(VELVET_REVERB_BEADS)
-/* Beads: SRAM1/2 (RAM_D2), defined in beads.cc. */
+/* Beads: SRAM1/2 (RAM_D2), all four filling it, defined in beads.cc. */
 extern float beads_predelay_a_storage[PRE_DELAY_LINE_SAMPLES];
 extern float beads_predelay_b_storage[PRE_DELAY_LINE_SAMPLES];
-#define PRE_DELAY_A_BASE  ((uintptr_t)beads_predelay_a_storage)
-#define PRE_DELAY_B_BASE  ((uintptr_t)beads_predelay_b_storage)
+extern float beads_predelay_a_r_storage[PRE_DELAY_LINE_SAMPLES];
+extern float beads_predelay_b_r_storage[PRE_DELAY_LINE_SAMPLES];
+#define PRE_DELAY_A_BASE    ((uintptr_t)beads_predelay_a_storage)
+#define PRE_DELAY_B_BASE    ((uintptr_t)beads_predelay_b_storage)
+#define PRE_DELAY_A_R_BASE  ((uintptr_t)beads_predelay_a_r_storage)
+#define PRE_DELAY_B_R_BASE  ((uintptr_t)beads_predelay_b_r_storage)
 #else
 /* Two float lines directly below the T2 ring: A then B, contiguous. */
 #define PRE_DELAY_A_BASE  (T2_RING_BASE - 2UL * PRE_DELAY_LINE_SAMPLES * 4UL)
@@ -254,7 +275,10 @@ extern float reverb_t0_tap_mod_rate;     /* Hz */
 void velvet_reverb_init(void);
 void velvet_reverb_regenerate_taps(void);
 
-void velvet_reverb_push_sample(int16_t input);
+void velvet_reverb_push_sample(int16_t input);            /* mono: both channels */
+void velvet_reverb_push_stereo(int16_t left, int16_t right);
+/* Output blocks completed so far (a count that only grows). */
+uint32_t velvet_reverb_blocks_done(void);
 int16_t velvet_reverb_out_left(void);
 int16_t velvet_reverb_out_right(void);
 

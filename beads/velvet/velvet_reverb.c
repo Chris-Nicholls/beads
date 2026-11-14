@@ -170,6 +170,24 @@ typedef uint32_t u32_alias __attribute__((may_alias));
 static int16_t t0_ring[T0_RING_SAMPLES + REVERB_BLOCK] CCM_ATTR;
 static int16_t t1_ring[T1_RING_SAMPLES + REVERB_BLOCK] T1_RING_ATTR;
 static int16_t * const t2_ring = (int16_t *)T2_RING_BASE;
+/* The right channel's rings. Same taps as the left, so a mono input gives the
+ * same result on both sides up to T2, whose L and R taps differ. On the Beads
+ * T0's and T1's do not fit beside the left's in DTCM, so they sit in ITCM
+ * (zero-wait for data loads too), behind a pad so neither starts at address 0.
+ * The startup code does not fill ITCM; velvet_reverb_init clears them. */
+#if defined(VELVET_REVERB_BEADS) && !defined(VELVET_REVERB_HOST)
+static struct {
+    uint32_t pad[8];
+    int16_t t0[T0_RING_SAMPLES + REVERB_BLOCK];
+    int16_t t1[T1_RING_SAMPLES + REVERB_BLOCK];
+} itcm_rings __attribute__((section(".itcm"), aligned(4)));
+#define t0_ring_r itcm_rings.t0
+#define t1_ring_r itcm_rings.t1
+#else
+static int16_t t0_ring_r[T0_RING_SAMPLES + REVERB_BLOCK] __attribute__((aligned(4)));
+static int16_t t1_ring_r[T1_RING_SAMPLES + REVERB_BLOCK] __attribute__((aligned(4)));
+#endif
+static int16_t * const t2_ring_r = (int16_t *)T2_RING_R_BASE;
 
 /* Mirror a ring's first REVERB_BLOCK samples into its guard region. Must run
  * after the block write and before any tap reads that ring. */
@@ -730,10 +748,12 @@ static float loop_thin_target = 0.0f, loop_thin_morph = 0.0f;   /* 0 = both line
 #define ID_XFADE  (480 * REVERB_RATE_MULT)                 /* 20 ms */
 #define ID_STEP   (0.001f * (float)REVERB_FS_HZ)           /* 1 ms */
 static int16_t * const input_delay = (int16_t *)INPUT_DELAY_BASE;
+static int16_t * const input_delay_r = (int16_t *)INPUT_DELAY_R_BASE;
 static uint32_t id_w;                       /* write index */
 static float id_target;                     /* delay asked for, samples */
 static int32_t id_cur, id_to, id_left;      /* delay read at, delay fading to, fade samples left */
 static float id_out[REVERB_BLOCK];          /* this block's delayed input, int16 scale */
+static float id_out_r[REVERB_BLOCK];
 
 void velvet_reverb_set_input_delay(float v)
 {
@@ -835,10 +855,15 @@ static volatile float pitch_mix_target   = 0.0f;
  * accumulate int16 quantisation noise. */
 static float * const predelay_a = (float *)PRE_DELAY_A_BASE;
 static float * const predelay_b = (float *)PRE_DELAY_B_BASE;
+/* The right channel's lines. Every per-line state below has an _r twin, run
+ * the same way, so a mono input loops identically on both sides. */
+static float * const predelay_a_r = (float *)PRE_DELAY_A_R_BASE;
+static float * const predelay_b_r = (float *)PRE_DELAY_B_R_BASE;
 static uint32_t predelay_wh = 0;            /* shared free-running write head */
 static float pre_mod_phase_a = 0.0f;
 static float pre_mod_phase_b = PI_F;        /* decorrelated phase */
 static float pre_hp_a = 0.0f, pre_hp_b = 0.0f;   /* per-line ~12 Hz DC block state */
+static float pre_hp_a_r = 0.0f, pre_hp_b_r = 0.0f;
 /* Per-line fractional-read state (see PREDELAY_READ): the allpass's last input
  * and output at 24 kHz, the cubic's four-sample window at 48 kHz. */
 #if REVERB_DECIM == 2
@@ -846,7 +871,7 @@ typedef struct { float prev_in, prev_out; } PdReadState;
 #else
 typedef struct { int32_t i; float y0, y1, y2, y3; } PdReadState;
 #endif
-static PdReadState pre_rd_a, pre_rd_b;
+static PdReadState pre_rd_a, pre_rd_b, pre_rd_a_r, pre_rd_b_r;
 /* A loop's length changes in steps: the line keeps its read at the old length
  * (so nothing it holds changes pitch) and crossfades to a read at the new one,
  * the way a tape loop is cut shorter or spliced longer. A step is taken only
@@ -861,10 +886,12 @@ typedef struct {
     int32_t left;          /* fade samples left, 0 = none */
     PdReadState rs;        /* the new read's interpolator state */
 } PdLen;
-static PdLen pre_len_a, pre_len_b;
+static PdLen pre_len_a, pre_len_b, pre_len_a_r, pre_len_b_r;
 static float duck_env = 0.0f;
 static Biquad pre_low_shelf_a CCM_ATTR, pre_high_shelf_a CCM_ATTR;
 static Biquad pre_low_shelf_b CCM_ATTR, pre_high_shelf_b CCM_ATTR;
+static Biquad pre_low_shelf_a_r CCM_ATTR, pre_high_shelf_a_r CCM_ATTR;
+static Biquad pre_low_shelf_b_r CCM_ATTR, pre_high_shelf_b_r CCM_ATTR;
 /* Cached shelf coeff inputs — recompute only on change. */
 static float last_fb_ls_hz = -1.0f, last_fb_ls_db = -999.0f;
 static float last_fb_hs_hz = -1.0f, last_fb_hs_db = -999.0f;
@@ -875,6 +902,7 @@ static float duck_atk_coeff = 0.0f;
  * to ±1 (may exceed during sustain build-up; clamped on the int16 ring write
  * in do_input_write_t0). */
 static float predelay_out[REVERB_BLOCK] CCM_ATTR;
+static float predelay_out_r[REVERB_BLOCK] CCM_ATTR;
 
 #ifdef VELVET_REVERB_HOST
 const float *host_dbg_predelay_out(void) { return predelay_out; }
@@ -970,11 +998,13 @@ static inline uint32_t diag_stage_cycles(uint32_t cyc0, uint32_t isr0)
 typedef char in_nbuf_pow2_check[((REVERB_IN_NBUF & (REVERB_IN_NBUF - 1)) == 0) ? 1 : -1];
 
 static int16_t in_ring[REVERB_IN_NBUF][REVERB_BLOCK];
+static int16_t in_ring_r[REVERB_IN_NBUF][REVERB_BLOCK];
 static volatile uint32_t in_wr_seq = 0;   /* written by ISR only */
 static volatile uint32_t in_rd_seq = 0;   /* written by poll only */
 static int16_t *input_ready = in_ring[0]; /* block poll is currently reading */
+static int16_t *input_ready_r = in_ring_r[0];
 static uint8_t  input_fill_idx = 0;
-static int32_t push_acc = 0;
+static int32_t push_acc = 0, push_acc_r = 0;
 static uint8_t push_phase = 0;
 static uint32_t block_write_idx = 0;
 /* High-water mark of queue occupancy: how much of the slack the main loop
@@ -1009,6 +1039,8 @@ static volatile uint32_t in_ready_cyc[REVERB_IN_NBUF];
 
 static int32_t accT0[REVERB_BLOCK] CCM_ATTR;
 static int32_t accT1[REVERB_BLOCK] CCM_ATTR;
+static int32_t accT0_r[REVERB_BLOCK] CCM_ATTR;
+static int32_t accT1_r[REVERB_BLOCK] CCM_ATTR;
 static int32_t accL [REVERB_BLOCK] CCM_ATTR;
 static int32_t accR [REVERB_BLOCK] CCM_ATTR;
 
@@ -1295,6 +1327,11 @@ static inline uint32_t t2_row_off(int r)
 {
     return (r < MAX_T2_TAPS) ? effOffT2L[r] : effOffT2R[r - MAX_T2_TAPS];
 }
+/* The L rows read the left T2 ring, the R rows the right. */
+static inline const int16_t *t2_row_ring(int r)
+{
+    return (r < MAX_T2_TAPS) ? t2_ring : t2_ring_r;
+}
 
 /* Where block bw's windows start within the rows (0, or REVERB_BLOCK for the
  * second block), or -1 if the rows do not hold them: fetched for another block,
@@ -1324,11 +1361,12 @@ static void t2_gather_sync(uint32_t bw)
         uint32_t idx = (bw - off) & T2_RING_MASK;
         t2_gather_off[r] = off;
         if (off < (uint32_t)T2_GATHER_SPAN) both = 0;
+        const int16_t *ring = t2_row_ring(r);
         if (idx + T2_GATHER_SPAN <= T2_RING_SAMPLES) {
-            memcpy(t2_gather[r], &t2_ring[idx], T2_GATHER_SPAN * sizeof(int16_t));
+            memcpy(t2_gather[r], &ring[idx], T2_GATHER_SPAN * sizeof(int16_t));
         } else {
             for (int i = 0; i < T2_GATHER_SPAN; i++)
-                t2_gather[r][i] = t2_ring[(idx + (uint32_t)i) & T2_RING_MASK];
+                t2_gather[r][i] = ring[(idx + (uint32_t)i) & T2_RING_MASK];
         }
     }
     t2_gather_bw = bw;
@@ -1385,13 +1423,13 @@ static void t2_gather_start(void)
         t2_gather_off[r] = off;
         if (off < (uint32_t)T2_GATHER_SPAN) both = 0;
         if (idx + T2_GATHER_SPAN <= T2_RING_SAMPLES) {
-            e->src = &t2_ring[idx];
+            e->src = &t2_row_ring(r)[idx];
             e->dst = t2_gather[r];
             e++;
         } else {
             /* Straddles the ring end: rare, so copy it here rather than split it. */
             for (int i = 0; i < T2_GATHER_SPAN; i++)
-                t2_gather[r][i] = t2_ring[(idx + (uint32_t)i) & T2_RING_MASK];
+                t2_gather[r][i] = t2_row_ring(r)[(idx + (uint32_t)i) & T2_RING_MASK];
         }
     }
     t2_gather_bw = bw;
@@ -1889,12 +1927,16 @@ void velvet_reverb_init(void)
         uint32_t *end = (uint32_t *)(T2_RING_BASE + T2_RING_SAMPLES * 2);
         while (p < end) *p++ = 0;
     }
+    memset(t0_ring_r, 0, sizeof t0_ring_r);
+    memset(t1_ring_r, 0, sizeof t1_ring_r);
+    memset(t2_ring_r, 0, T2_RING_SAMPLES * sizeof(int16_t));
 
     for (int i = 0; i < REVERB_BLOCK; i++) {
         accT0[i] = 0; accT1[i] = 0; accL[i] = 0; accR[i] = 0;
+        accT0_r[i] = 0; accT1_r[i] = 0;
     }
     for (int b = 0; b < REVERB_IN_NBUF; b++)
-        for (int i = 0; i < REVERB_BLOCK; i++) in_ring[b][i] = 0;
+        for (int i = 0; i < REVERB_BLOCK; i++) in_ring[b][i] = in_ring_r[b][i] = 0;
     for (int b = 0; b < REVERB_OUT_NBUF; b++) {
         for (int i = 0; i < REVERB_OUT_BLOCK; i++) {
             outL[b][i] = 0; outR[b][i] = 0;
@@ -1908,11 +1950,12 @@ void velvet_reverb_init(void)
     }
     lim_phase = 0;
     lim_gain = 1.0f; lim_gain_target = 1.0f;
-    push_acc = 0; push_phase = 0;
+    push_acc = push_acc_r = 0; push_phase = 0;
     in_wr_seq = 0; in_rd_seq = 0;
     input_fill_idx = 0;
     input_ready = in_ring[0];
-    for (uint32_t i = 0; i < INPUT_DELAY_SAMPLES; i++) input_delay[i] = 0;
+    input_ready_r = in_ring_r[0];
+    for (uint32_t i = 0; i < INPUT_DELAY_SAMPLES; i++) input_delay[i] = input_delay_r[i] = 0;
     id_w = 0; id_left = 0;
     id_cur = id_to = (int32_t)(id_target + 0.5f);
     input_queue_max = 0;
@@ -1936,14 +1979,19 @@ void velvet_reverb_init(void)
     hpf_hz_morph = reverb_hpf_hz;
 
     /* ---- Pre-delay sustain engine ---- */
-    for (uint32_t i = 0; i < PRE_DELAY_LINE_SAMPLES; i++) { predelay_a[i] = 0.0f; predelay_b[i] = 0.0f; }
+    for (uint32_t i = 0; i < PRE_DELAY_LINE_SAMPLES; i++) {
+        predelay_a[i] = predelay_b[i] = 0.0f;
+        predelay_a_r[i] = predelay_b_r[i] = 0.0f;
+    }
     predelay_wh = 0;
     pre_mod_phase_a = 0.0f; pre_mod_phase_b = PI_F;
-    pre_hp_a = pre_hp_b = 0.0f;
+    pre_hp_a = pre_hp_b = pre_hp_a_r = pre_hp_b_r = 0.0f;
     /* All zero is a valid cubic window too: the lines it describes were just
      * zeroed. */
     memset(&pre_rd_a, 0, sizeof pre_rd_a);
     memset(&pre_rd_b, 0, sizeof pre_rd_b);
+    memset(&pre_rd_a_r, 0, sizeof pre_rd_a_r);
+    memset(&pre_rd_b_r, 0, sizeof pre_rd_b_r);
     duck_env = 0.0f;
     pre_low_shelf_a.z1 = pre_low_shelf_a.z2 = 0.0f;
     pre_high_shelf_a.z1 = pre_high_shelf_a.z2 = 0.0f;
@@ -1953,6 +2001,8 @@ void velvet_reverb_init(void)
     biquad_copy_coeffs(&pre_low_shelf_b, &pre_low_shelf_a);
     biquad_highshelf(&pre_high_shelf_a, reverb_fb_high_shelf_hz, reverb_fb_high_shelf_db, (float)REVERB_FS_HZ);
     biquad_copy_coeffs(&pre_high_shelf_b, &pre_high_shelf_a);
+    pre_low_shelf_a_r = pre_low_shelf_a;   pre_low_shelf_b_r = pre_low_shelf_b;
+    pre_high_shelf_a_r = pre_high_shelf_a; pre_high_shelf_b_r = pre_high_shelf_b;
     last_fb_ls_hz = reverb_fb_low_shelf_hz;  last_fb_ls_db = reverb_fb_low_shelf_db;
     last_fb_hs_hz = reverb_fb_high_shelf_hz; last_fb_hs_db = reverb_fb_high_shelf_db;
     fb_hs_hz_morph = reverb_fb_high_shelf_hz;
@@ -1985,6 +2035,7 @@ void velvet_reverb_init(void)
     memset(&pre_len_b, 0, sizeof pre_len_b);
     pre_len_a.time = predelay_a_morph;
     pre_len_b.time = predelay_b_morph;
+    pre_len_a_r = pre_len_a; pre_len_b_r = pre_len_b;
 
     /* Pre-compute the exponential envelope LUT — exp(-9.21034 × frac) gives
      * an 80 dB drop over the window. Linearly interpolated at lookup. */
@@ -2894,7 +2945,10 @@ __attribute__((always_inline)) static inline float fast_sin_pi(float x)
 
 static float pd_node_a[REVERB_BLOCK] __attribute__((aligned(4)));
 static float pd_node_b[REVERB_BLOCK] __attribute__((aligned(4)));
+static float pd_node_a_r[REVERB_BLOCK] __attribute__((aligned(4)));
+static float pd_node_b_r[REVERB_BLOCK] __attribute__((aligned(4)));
 static float pd_px    [REVERB_BLOCK] CCM_ATTR;
+static float pd_px_r  [REVERB_BLOCK] CCM_ATTR;
 static float pd_fbeff [REVERB_BLOCK] CCM_ATTR;
 static float pd_frz   [REVERB_BLOCK] CCM_ATTR;   /* freeze amount per sample, 0..1 */
 
@@ -2916,6 +2970,22 @@ static float pd_frz   [REVERB_BLOCK] CCM_ATTR;   /* freeze amount per sample, 0.
  * whole sound, so the feed takes at least this much of it while frozen, should
  * that mix be set lower. */
 #define FREEZE_MIX_MIN       0.7f
+/* Cross-feed between the channels, so a sound on one side reverberates on
+ * both. Each is x + k * (other - x): exact when the sides match, so a mono
+ * input is untouched.
+ *   STEREO_LOOP_XFEED  each loop pass hands this share of a line's node to
+ *     the other side's line, so an off-centre sound's loop tail spreads
+ *     evenly within a second or so (the difference between the sides keeps
+ *     1 - 2k of itself per pass);
+ *   STEREO_T2_XFEED    the T1 -> T2 bridge does the same at once, so the far
+ *     side's tail starts with the near one, ~10 dB down, rather than waiting
+ *     a loop pass. The early stages (T0, T1) stay on their own side. */
+#ifndef STEREO_LOOP_XFEED
+#define STEREO_LOOP_XFEED    0.1f
+#endif
+#ifndef STEREO_T2_XFEED
+#define STEREO_T2_XFEED      0.25f
+#endif
 static volatile uint8_t freeze_request = 0;
 static float freeze_amt = 0.0f;
 
@@ -3057,7 +3127,7 @@ static void pd_init(void)
 __attribute__((always_inline)) static inline
 void pd_line_pass(float *phase, PdReadState *rd, Biquad *lsh, Biquad *hsh, float *hp,
                   const float *line, float wbase, PdLen *len,
-                  float modDepth, float modInc, float *node)
+                  float modDepth, float modInc, const float *px, float *node)
 {
     PdReadState rs = *rd;
     float time = len->time;
@@ -3076,7 +3146,7 @@ void pd_line_pass(float *phase, PdReadState *rd, Biquad *lsh, Biquad *hsh, float
         }
         float rf = biquad_process(hsh, biquad_process(lsh, r));
         *hp += pre_hp_coeff * (rf - *hp);
-        float nd = pd_px[n] + pd_fbeff[n] * (rf - *hp);
+        float nd = px[n] + pd_fbeff[n] * (rf - *hp);
         nd += pd_frz[n] * (r - nd);              /* frozen: the raw read, unity gain */
 #ifdef VELVET_REVERB_HOST
         { float m = nd < 0.0f ? -nd : nd;
@@ -3159,6 +3229,8 @@ typedef struct {
 /* In SRAM, not CCM: their stretches are DMA targets (see oct_fetch). */
 static OctHead oct_head_a __attribute__((aligned(4))), oct_head_b __attribute__((aligned(4)));
 static OctHead rev_head_a __attribute__((aligned(4))), rev_head_b __attribute__((aligned(4)));
+/* The right channel's: copied by CPU (there are DMA streams for one set). */
+static OctHead oct_head_a_r, oct_head_b_r, rev_head_a_r, rev_head_b_r;
 static uint8_t rev_active = 0;               /* reverse heads running */
 static float oct_ramp[OCT_RAMP_BINS + 1];    /* sin^2 from 0 to 1 */
 static float pitch_semis_morph = 0.0f;
@@ -3205,6 +3277,14 @@ static void oct_init(void)
     memset(&rev_head_b, 0, sizeof rev_head_b);
     rev_head_a.f.sn = rev_head_a.xf.sn = PD_CPU;
     rev_head_b.f.sn = rev_head_b.xf.sn = PD_CPU;
+    memset(&oct_head_a_r, 0, sizeof oct_head_a_r);
+    memset(&oct_head_b_r, 0, sizeof oct_head_b_r);
+    memset(&rev_head_a_r, 0, sizeof rev_head_a_r);
+    memset(&rev_head_b_r, 0, sizeof rev_head_b_r);
+    oct_head_a_r.f.sn = oct_head_a_r.xf.sn = PD_CPU;
+    oct_head_b_r.f.sn = oct_head_b_r.xf.sn = PD_CPU;
+    rev_head_a_r.f.sn = rev_head_a_r.xf.sn = PD_CPU;
+    rev_head_b_r.f.sn = rev_head_b_r.xf.sn = PD_CPU;
     rev_active = 0; reverse_amt = 0.0f;
 }
 
@@ -3316,6 +3396,10 @@ static float oct_out_a[REVERB_BLOCK] CCM_ATTR;
 static float oct_out_b[REVERB_BLOCK] CCM_ATTR;
 static float rev_out_a[REVERB_BLOCK] CCM_ATTR;
 static float rev_out_b[REVERB_BLOCK] CCM_ATTR;
+static float oct_out_a_r[REVERB_BLOCK] CCM_ATTR;
+static float oct_out_b_r[REVERB_BLOCK] CCM_ATTR;
+static float rev_out_a_r[REVERB_BLOCK] CCM_ATTR;
+static float rev_out_b_r[REVERB_BLOCK] CCM_ATTR;
 
 #if defined(DIAG_REVERB_PROFILE) && !defined(VELVET_REVERB_HOST)
 /* Device-side check of the DMA paths, which the host build replaces with memcpy
@@ -3338,14 +3422,65 @@ static void do_input_delay(void)
     for (int n = 0; n < REVERB_BLOCK; n++) {
         const uint32_t w = id_w++;
         input_delay[w & INPUT_DELAY_MASK] = input_ready[n];
-        float x = (float)input_delay[(w - (uint32_t)id_cur) & INPUT_DELAY_MASK];
+        input_delay_r[w & INPUT_DELAY_MASK] = input_ready_r[n];
+        const uint32_t rc = (w - (uint32_t)id_cur) & INPUT_DELAY_MASK;
+        float x = (float)input_delay[rc], xr = (float)input_delay_r[rc];
         if (id_left > 0) {
-            const float x2 = (float)input_delay[(w - (uint32_t)id_to) & INPUT_DELAY_MASK];
+            const uint32_t rt = (w - (uint32_t)id_to) & INPUT_DELAY_MASK;
             const float t = (float)(ID_XFADE - id_left) * (1.0f / (float)ID_XFADE);
-            x += t * t * (3.0f - 2.0f * t) * (x2 - x);
+            const float k = t * t * (3.0f - 2.0f * t);
+            x  += k * ((float)input_delay[rt] - x);
+            xr += k * ((float)input_delay_r[rt] - xr);
             if (--id_left == 0) id_cur = id_to;
         }
         id_out[n] = x;
+        id_out_r[n] = xr;
+    }
+}
+
+/* One channel's cascade feed for the block, from its input, its two line
+ * nodes and its pitch and reverse heads. The block-wide weights are shared. */
+typedef struct {
+    float mix, wA, wB, dryK;
+    float keep0, keep1, shift0, shift1;
+    int oct_run, rev_run;
+} PdMix;
+
+static void pd_mix(const PdMix *pm, const float *pdpx, const float *idout,
+                   const float *na, const float *nb, const float *oa, const float *ob,
+                   const float *ra, const float *rb, float *out)
+{
+    const float to_unit = 1.0f / 32768.0f;
+    const float invBlock = 1.0f / (float)REVERB_BLOCK;
+    const float mix = pm->mix, wA = pm->wA, wB = pm->wB;
+    for (int n = 0; n < REVERB_BLOCK; n++) {
+        float px = pdpx[n];
+        const float fz = pd_frz[n];
+        const float rv = pm->rev_run ? pd_rev[n] : 0.0f;
+        const float hold = fz > rv ? fz : rv;
+        const float m = mix + hold * ((mix > FREEZE_MIX_MIN ? mix : FREEZE_MIX_MIN) - mix);
+        float lines = wA * na[n] + wB * nb[n];
+        if (pm->rev_run) lines += rv * (wA * ra[n] + wB * rb[n] - lines);
+        float feed = px + m * (lines - px);
+        feed += fz * pm->dryK * (idout[n] * to_unit);   /* frozen: input straight to the taps */
+
+        if (pm->oct_run) {
+            /* The heads advance every sample while running, at any mix, so
+             * they stay in step with their fetched stretches. */
+            float sA = wA * oa[n];
+            float sB = wB * ob[n];
+            /* Shifted counterpart of feed = px + mix * (nodeA + nodeB - px).
+             * There is no separate shifted px: the lines carry it, but the
+             * heads read the two lines at different delays, so it adds up
+             * incoherently. (sA + sB) / sqrt(2) stands in for it. */
+            float shifted = ((1.0f - m) * 0.70710678f + m) * (sA + sB);
+            const float t = (float)n * invBlock;
+            const float keep  = pm->keep0  + t * (pm->keep1  - pm->keep0);
+            const float shift = pm->shift0 + t * (pm->shift1 - pm->shift0);
+            feed = keep * feed + shift * shifted;
+        }
+
+        out[n] = feed;
     }
 }
 
@@ -3375,6 +3510,8 @@ static void do_predelay(void)
     if (timeB > (float)PRE_DELAY_MAX_SAMPLES) timeB = (float)PRE_DELAY_MAX_SAMPLES;
     pd_len_update(&pre_len_a, timeA);
     pd_len_update(&pre_len_b, timeB);
+    pd_len_update(&pre_len_a_r, timeA);
+    pd_len_update(&pre_len_b_r, timeB);
     timeA = pre_len_a.time;   /* the lengths the loop reads at this block */
     timeB = pre_len_b.time;
 
@@ -3406,10 +3543,12 @@ static void do_predelay(void)
 #if REVERB_LOOP_T60_SHELVES
     if (reverb_t60_shelves_on) { ls_db = t60_ls_db; hs_db = t60_hs_db; }
 #endif
-    /* Shared shelf coeffs — recompute (for both lines) only on change. */
+    /* Shared shelf coeffs — recompute (for all four lines) only on change. */
     if (reverb_fb_low_shelf_hz != last_fb_ls_hz || ls_db != last_fb_ls_db) {
         biquad_lowshelf(&pre_low_shelf_a, reverb_fb_low_shelf_hz, ls_db, (float)REVERB_FS_HZ);
         biquad_copy_coeffs(&pre_low_shelf_b, &pre_low_shelf_a);
+        biquad_copy_coeffs(&pre_low_shelf_a_r, &pre_low_shelf_a);
+        biquad_copy_coeffs(&pre_low_shelf_b_r, &pre_low_shelf_a);
         last_fb_ls_hz = reverb_fb_low_shelf_hz; last_fb_ls_db = ls_db;
     }
     /* Tone-mapped high shelf sits IN the feedback loop, so a raw coeff jump
@@ -3419,12 +3558,15 @@ static void do_predelay(void)
         hs_db != last_fb_hs_db) {
         biquad_highshelf(&pre_high_shelf_a, fb_hs_hz_morph, hs_db, (float)REVERB_FS_HZ);
         biquad_copy_coeffs(&pre_high_shelf_b, &pre_high_shelf_a);
+        biquad_copy_coeffs(&pre_high_shelf_a_r, &pre_high_shelf_a);
+        biquad_copy_coeffs(&pre_high_shelf_b_r, &pre_high_shelf_a);
         last_fb_hs_hz = fb_hs_hz_morph; last_fb_hs_db = hs_db;
     }
 
     /* The previous block's line-B write-back must land before anything reads the
      * lines again: the octave heads read as little as OCT_MIN_DELAY behind the
-     * write head, which reaches back into the previous block. */
+     * write head, which reaches back into the previous block. (The right
+     * channel's lines are written back by CPU, at once.) */
     if (pd_wb_pending) {
         pd_wb_pending = 0;
         pd_writeback_finish_now(predelay_b, pd_node_b, pd_wb_idx);
@@ -3440,15 +3582,20 @@ static void do_predelay(void)
          * with no feedback, so the pitch feed heads find fresh audio if the
          * pitch mix is turned up later. */
         for (int n = 0; n < REVERB_BLOCK; n++) {
-            float px = id_out[n] * to_unit;
+            float px = id_out[n] * to_unit, pxr = id_out_r[n] * to_unit;
             predelay_out[n] = px;
+            predelay_out_r[n] = pxr;
             pd_node_a[n] = px;
             pd_node_b[n] = px;
+            pd_node_a_r[n] = pxr;
+            pd_node_b_r[n] = pxr;
         }
         pd_writeback_start(predelay_a, pd_node_a, widx);
         pd_writeback_finish_now(predelay_a, pd_node_a, widx);
         pd_writeback_start(predelay_b, pd_node_b, widx);
         pd_wb_idx = widx; pd_wb_pending = 1;
+        memcpy(&predelay_a_r[widx], pd_node_a_r, REVERB_BLOCK * sizeof(float));
+        memcpy(&predelay_b_r[widx], pd_node_b_r, REVERB_BLOCK * sizeof(float));
         /* Keep the write head advancing so resuming feedback reads sane history. */
         predelay_wh += REVERB_BLOCK;
         if (predelay_wh >= REVERB_IDX_WRAP) predelay_wh -= REVERB_IDX_WRAP;
@@ -3458,7 +3605,8 @@ static void do_predelay(void)
     /* Pitch feed heads: start, stop and jumps happen here, at the block
      * boundary, and each head fetches its stretch of line. The rate glides
      * block to block; loop lengths use the modulation as it stands at the
-     * block start. */
+     * block start. The right channel's heads run alongside the left's, in
+     * step (same loop, same rate), on its own lines. */
     pitch_semis_morph += PITCH_ALPHA * (pitch_semis_target - pitch_semis_morph);
     float rate = powf(2.0f, pitch_semis_morph * (1.0f / 12.0f));
     if (rate > 2.0f) rate = 2.0f; else if (rate < 0.5f) rate = 0.5f;
@@ -3473,6 +3621,8 @@ static void do_predelay(void)
         oct_active = 1;
         oct_head_start(&oct_head_a, loopA, rate);
         oct_head_start(&oct_head_b, loopB, rate);
+        oct_head_start(&oct_head_a_r, loopA, rate);
+        oct_head_start(&oct_head_b_r, loopB, rate);
     } else if (oct_active && mixTarget == 0.0f && pitch_mix_morph == 0.0f) {
         oct_active = 0;
     }
@@ -3481,6 +3631,8 @@ static void do_predelay(void)
         rev_active = 1;
         oct_head_start(&rev_head_a, loopA, -1.0f);
         oct_head_start(&rev_head_b, loopB, -1.0f);
+        oct_head_start(&rev_head_a_r, loopA, -1.0f);
+        oct_head_start(&rev_head_b_r, loopB, -1.0f);
     } else if (rev_active && !rev_on && reverse_amt == 0.0f) {
         rev_active = 0;
     }
@@ -3499,24 +3651,31 @@ static void do_predelay(void)
         mix1 = mix0 + dm;
         pitch_mix_morph = mix1;
     }
-    const float keep0 = cosf(0.5f * PI_F * mix0), shift0 = sinf(0.5f * PI_F * mix0);
-    const float keep1 = cosf(0.5f * PI_F * mix1), shift1 = sinf(0.5f * PI_F * mix1);
-    const float invBlock = 1.0f / (float)REVERB_BLOCK;
+    PdMix pm;
+    pm.keep0 = cosf(0.5f * PI_F * mix0); pm.shift0 = sinf(0.5f * PI_F * mix0);
+    pm.keep1 = cosf(0.5f * PI_F * mix1); pm.shift1 = sinf(0.5f * PI_F * mix1);
     if (oct_run) {
         oct_head_begin_block(&oct_head_a, predelay_a, w0, loopA, rate);
         oct_head_begin_block(&oct_head_b, predelay_b, w0, loopB, rate);
+        oct_head_begin_block(&oct_head_a_r, predelay_a_r, w0, loopA, rate);
+        oct_head_begin_block(&oct_head_b_r, predelay_b_r, w0, loopB, rate);
     }
     if (rev_run) {
         oct_head_begin_block(&rev_head_a, predelay_a, w0, loopA, -1.0f);
         oct_head_begin_block(&rev_head_b, predelay_b, w0, loopB, -1.0f);
+        oct_head_begin_block(&rev_head_a_r, predelay_a_r, w0, loopA, -1.0f);
+        oct_head_begin_block(&rev_head_b_r, predelay_b_r, w0, loopB, -1.0f);
     }
 
     const float wbase = (float)widx;
 
-    /* Ducking, per sample, shared by both lines. */
+    /* Ducking, per sample, shared by all four lines: it follows the louder
+     * side, so the two sides duck together and the image holds. */
     for (int n = 0; n < REVERB_BLOCK; n++) {
-        float px = id_out[n] * to_unit;
+        float px = id_out[n] * to_unit, pxr = id_out_r[n] * to_unit;
         float rect = px < 0.0f ? -px : px;
+        float rectr = pxr < 0.0f ? -pxr : pxr;
+        if (rectr > rect) rect = rectr;
         if (rect > duck_env) duck_env += duck_atk_coeff * (rect - duck_env);
         else                 duck_env += duckRelCoef   * (rect - duck_env);
         float duck = duckAmount * duck_env; if (duck > 1.0f) duck = 1.0f;
@@ -3527,68 +3686,69 @@ static void do_predelay(void)
         else        { reverse_amt -= 1.0f / FREEZE_FADE_SAMPLES; if (reverse_amt < 0.0f) reverse_amt = 0.0f; }
         pd_rev[n]   = reverse_amt;
         pd_px[n]    = px * (1.0f - freeze_amt);   /* frozen: no new input */
+        pd_px_r[n]  = pxr * (1.0f - freeze_amt);
         pd_fbeff[n] = fb * (1.0f - duck);
     }
 
-    /* Line A, then line B while A's write-back runs. */
+    /* Line A, then line B while A's write-back runs. The right channel's
+     * lines take the same modulation, from the same starting phases. */
+    float phA_r = pre_mod_phase_a, phB_r = pre_mod_phase_b;
     pd_line_pass(&pre_mod_phase_a, &pre_rd_a, &pre_low_shelf_a, &pre_high_shelf_a, &pre_hp_a,
-                 predelay_a, wbase, &pre_len_a, modDepth, modInc, pd_node_a);
-    pd_writeback_start(predelay_a, pd_node_a, widx);
+                 predelay_a, wbase, &pre_len_a, modDepth, modInc, pd_px, pd_node_a);
     pd_line_pass(&pre_mod_phase_b, &pre_rd_b, &pre_low_shelf_b, &pre_high_shelf_b, &pre_hp_b,
-                 predelay_b, wbase, &pre_len_b, modDepth, modInc, pd_node_b);
+                 predelay_b, wbase, &pre_len_b, modDepth, modInc, pd_px, pd_node_b);
+    pd_line_pass(&phA_r, &pre_rd_a_r, &pre_low_shelf_a_r, &pre_high_shelf_a_r, &pre_hp_a_r,
+                 predelay_a_r, wbase, &pre_len_a_r, modDepth, modInc, pd_px_r, pd_node_a_r);
+    pd_line_pass(&phB_r, &pre_rd_b_r, &pre_low_shelf_b_r, &pre_high_shelf_b_r, &pre_hp_b_r,
+                 predelay_b_r, wbase, &pre_len_b_r, modDepth, modInc, pd_px_r, pd_node_b_r);
+    /* Cross-feed (STEREO_LOOP_XFEED), held off while frozen so a frozen loop
+     * keeps exactly what it holds. */
+    for (int n = 0; n < REVERB_BLOCK; n++) {
+        const float k = STEREO_LOOP_XFEED * (1.0f - pd_frz[n]);
+        const float al = pd_node_a[n], ar = pd_node_a_r[n];
+        const float bl = pd_node_b[n], br = pd_node_b_r[n];
+        pd_node_a[n] = al + k * (ar - al); pd_node_a_r[n] = ar + k * (al - ar);
+        pd_node_b[n] = bl + k * (br - bl); pd_node_b_r[n] = br + k * (bl - br);
+    }
+    pd_writeback_start(predelay_a, pd_node_a, widx);
     pd_writeback_finish_now(predelay_a, pd_node_a, widx);
     pd_writeback_start(predelay_b, pd_node_b, widx);   /* finished at the next block's start */
     pd_wb_idx = widx; pd_wb_pending = 1;
+    memcpy(&predelay_a_r[widx], pd_node_a_r, REVERB_BLOCK * sizeof(float));
+    memcpy(&predelay_b_r[widx], pd_node_b_r, REVERB_BLOCK * sizeof(float));
 
     if (oct_run) {
         oct_head_land(&oct_head_a);
         oct_head_land(&oct_head_b);
+        oct_head_land(&oct_head_a_r);
+        oct_head_land(&oct_head_b_r);
         oct_head_run(&oct_head_a, w0, rate, oct_out_a);
         oct_head_run(&oct_head_b, w0, rate, oct_out_b);
+        oct_head_run(&oct_head_a_r, w0, rate, oct_out_a_r);
+        oct_head_run(&oct_head_b_r, w0, rate, oct_out_b_r);
     }
     if (rev_run) {
         oct_head_land(&rev_head_a);
         oct_head_land(&rev_head_b);
+        oct_head_land(&rev_head_a_r);
+        oct_head_land(&rev_head_b_r);
         oct_head_run(&rev_head_a, w0, -1.0f, rev_out_a);
         oct_head_run(&rev_head_b, w0, -1.0f, rev_out_b);
+        oct_head_run(&rev_head_a_r, w0, -1.0f, rev_out_a_r);
+        oct_head_run(&rev_head_b_r, w0, -1.0f, rev_out_b_r);
     }
 
     /* Mix into the cascade feed, plus the pitch heads. Line A's share fades
      * out as Density thins the echoes, B making up the level (the lines are
      * uncorrelated, so their powers add). */
-    const float wA = 1.0f - loop_thin_morph, wB = sqrtf(2.0f - wA * wA);
+    pm.mix = mix;
+    pm.wA = 1.0f - loop_thin_morph; pm.wB = sqrtf(2.0f - pm.wA * pm.wA);
     /* Unfrozen, the input reaches the feed directly by (1 - mix) and through
      * both line nodes by mix: this is its total. Frozen, it is fed at that. */
-    const float dryK = 1.0f - mix + mix * (wA + wB);
-    for (int n = 0; n < REVERB_BLOCK; n++) {
-        float px = pd_px[n];
-        const float fz = pd_frz[n];
-        const float rv = rev_run ? pd_rev[n] : 0.0f;
-        const float hold = fz > rv ? fz : rv;
-        const float m = mix + hold * ((mix > FREEZE_MIX_MIN ? mix : FREEZE_MIX_MIN) - mix);
-        float lines = wA * pd_node_a[n] + wB * pd_node_b[n];
-        if (rev_run) lines += rv * (wA * rev_out_a[n] + wB * rev_out_b[n] - lines);
-        float feed = px + m * (lines - px);
-        feed += fz * dryK * (id_out[n] * to_unit);   /* frozen: input straight to the taps */
-
-        if (oct_run) {
-            /* The heads advance every sample while running, at any mix, so
-             * they stay in step with their fetched stretches. */
-            float sA = wA * oct_out_a[n];
-            float sB = wB * oct_out_b[n];
-            /* Shifted counterpart of feed = px + mix * (nodeA + nodeB - px).
-             * There is no separate shifted px: the lines carry it, but the
-             * heads read the two lines at different delays, so it adds up
-             * incoherently. (sA + sB) / sqrt(2) stands in for it. */
-            float shifted = ((1.0f - m) * 0.70710678f + m) * (sA + sB);
-            const float t = (float)n * invBlock;
-            const float keep  = keep0  + t * (keep1  - keep0);
-            const float shift = shift0 + t * (shift1 - shift0);
-            feed = keep * feed + shift * shifted;
-        }
-
-        predelay_out[n] = feed;
-    }
+    pm.dryK = 1.0f - mix + mix * (pm.wA + pm.wB);
+    pm.oct_run = oct_run; pm.rev_run = rev_run;
+    pd_mix(&pm, pd_px, id_out, pd_node_a, pd_node_b, oct_out_a, oct_out_b, rev_out_a, rev_out_b, predelay_out);
+    pd_mix(&pm, pd_px_r, id_out_r, pd_node_a_r, pd_node_b_r, oct_out_a_r, oct_out_b_r, rev_out_a_r, rev_out_b_r, predelay_out_r);
     predelay_wh += REVERB_BLOCK;
     if (predelay_wh >= REVERB_IDX_WRAP) predelay_wh -= REVERB_IDX_WRAP;
 }
@@ -3615,8 +3775,10 @@ static void do_input_write_t0(void)
         if (mag > SOFT_KNEE_T * 32768.0f) host_dbg_t0_sat_count++;   /* knee, not over */
 #endif
         t0_ring[wi & T0_RING_MASK] = soft_clip_int16(v);
+        t0_ring_r[wi & T0_RING_MASK] = soft_clip_int16(predelay_out_r[i] * (32768.0f * REVERB_HEADROOM));
     }
     ring_guard_sync(t0_ring, T0_RING_SAMPLES);
+    ring_guard_sync(t0_ring_r, T0_RING_SAMPLES);
     block_write_idx = ring_write_idx;
     ring_write_idx += REVERB_BLOCK;
     /* Keep the free-running index in float-exact range. block_write_idx is cast to
@@ -3628,7 +3790,7 @@ static void do_input_write_t0(void)
      * across the wrap and floats stay exact indefinitely. */
     if (ring_write_idx >= REVERB_IDX_WRAP) ring_write_idx -= REVERB_IDX_WRAP;
 
-    for (int i = 0; i < REVERB_BLOCK; i++) accT0[i] = 0;
+    for (int i = 0; i < REVERB_BLOCK; i++) accT0[i] = accT0_r[i] = 0;
 }
 
 /* Fast (SIMD pair-read) T0 convolution — used when the per-tap LFO is off. */
@@ -3636,43 +3798,43 @@ static void do_input_write_t0(void)
  * accT0[n] += t0_ring[(base + n) & mask] * gain  for n in [0, REVERB_BLOCK).
  * `base` must already be masked into [0, T0_RING_SAMPLES). Shared by the fast
  * (unmodulated) path and the modulated path's two interpolation passes. */
-static void accumulate_t0(uint32_t base, uint32_t gain)
+static void accumulate_t0(const int16_t *ring, int32_t *acc, uint32_t base, uint32_t gain)
 {
     /* Common case: the whole block reads contiguously without wrapping the
      * ring. Keep this a tight, fixed-count SIMD loop (REVERB_BLOCK is a small
      * even constant) so the compiler fully unrolls it — this is the hot path. */
     if (T0_RING_SAMPLES - base >= (uint32_t)REVERB_BLOCK) {
-        const int16_t *src = &t0_ring[base];
+        const int16_t *src = &ring[base];
         for (int i = 0; i < REVERB_BLOCK; i += 2) {
             uint32_t s_pair = *((const u32_alias *)(src + i));
-            accT0[i]   = qadd_sat(accT0[i],   smulbb(s_pair, gain));
-            accT0[i+1] = qadd_sat(accT0[i+1], smultb(s_pair, gain));
+            acc[i]   = qadd_sat(acc[i],   smulbb(s_pair, gain));
+            acc[i+1] = qadd_sat(acc[i+1], smultb(s_pair, gain));
         }
         return;
     }
     /* Rare case: the read window straddles the ring wrap. Segment 1 is the
      * contiguous run of n1 samples from base; segment 2 reads from ring start.
      * Pairs are only read within a segment, so a pair never straddles the wrap
-     * (which would over-read / over-write accT0); the odd boundary sample of
+     * (which would over-read / over-write acc); the odd boundary sample of
      * each segment is handled with a scalar multiply. */
     uint32_t n1 = T0_RING_SAMPLES - base;
     int i = 0;
     for (; i + 1 < (int)n1; i += 2) {
-        uint32_t s_pair = *((const u32_alias *)(&t0_ring[base + (uint32_t)i]));
-        accT0[i]   = qadd_sat(accT0[i],   smulbb(s_pair, gain));
-        accT0[i+1] = qadd_sat(accT0[i+1], smultb(s_pair, gain));
+        uint32_t s_pair = *((const u32_alias *)(&ring[base + (uint32_t)i]));
+        acc[i]   = qadd_sat(acc[i],   smulbb(s_pair, gain));
+        acc[i+1] = qadd_sat(acc[i+1], smultb(s_pair, gain));
     }
     if (i < (int)n1) {
-        accT0[i] = qadd_sat(accT0[i], smulbb((uint32_t)(uint16_t)t0_ring[base + (uint32_t)i], gain));
+        acc[i] = qadd_sat(acc[i], smulbb((uint32_t)(uint16_t)ring[base + (uint32_t)i], gain));
         i++;
     }
     for (; i + 1 < REVERB_BLOCK; i += 2) {
-        uint32_t s_pair = *((const u32_alias *)(&t0_ring[(uint32_t)i - n1]));
-        accT0[i]   = qadd_sat(accT0[i],   smulbb(s_pair, gain));
-        accT0[i+1] = qadd_sat(accT0[i+1], smultb(s_pair, gain));
+        uint32_t s_pair = *((const u32_alias *)(&ring[(uint32_t)i - n1]));
+        acc[i]   = qadd_sat(acc[i],   smulbb(s_pair, gain));
+        acc[i+1] = qadd_sat(acc[i+1], smultb(s_pair, gain));
     }
     if (i < REVERB_BLOCK) {
-        accT0[i] = qadd_sat(accT0[i], smulbb((uint32_t)(uint16_t)t0_ring[(uint32_t)i - n1], gain));
+        acc[i] = qadd_sat(acc[i], smulbb((uint32_t)(uint16_t)ring[(uint32_t)i - n1], gain));
     }
 }
 
@@ -3682,7 +3844,8 @@ REVERB_CONV_FN static void do_t0_phase_fast(void)
     for (int t = 0; t < tapEnd; t++) {
         uint32_t gain = (uint32_t)(int32_t)effGains_t0[t];
         uint32_t base = (block_write_idx - (uint32_t)effOffT0[t]) & T0_RING_MASK;
-        accumulate_t0(base, gain);
+        accumulate_t0(t0_ring, accT0, base, gain);
+        accumulate_t0(t0_ring_r, accT0_r, base, gain);
     }
 }
 
@@ -3715,6 +3878,8 @@ static uint32_t t0_mod_gab [MAX_T0_TAPS] CCM_ATTR;
  * interpolation folded into the tap gain and applied in a single SMLAD pass
  * (see accumulate_t0_interp):
  *   accT0[n] += g·rf · ring[ri_base-1+n] + g·(1-rf) · ring[ri_base+n] */
+REVERB_CONV_FN static void t0_mod_pass2(const int16_t *ring, int32_t *acc, int n);
+
 REVERB_CONV_FN static void do_t0_phase_mod(float depth)
 {
     int tapEnd = t0TapCount;
@@ -3749,19 +3914,26 @@ REVERB_CONV_FN static void do_t0_phase_mod(float depth)
      * The internal sum cannot overflow: |ring·ga + ring·gb| <= 32767·(ga+gb)
      * = 32767·g <= 32767². The guard region makes the (REVERB_BLOCK+1)-sample
      * window contiguous for every base, so there is no wrap test and no gather. */
+    t0_mod_pass2(t0_ring, accT0, n);
+    t0_mod_pass2(t0_ring_r, accT0_r, n);
+}
+
+/* Pass 2 of do_t0_phase_mod for one channel's ring, from pass 1's taps. */
+REVERB_CONV_FN static void t0_mod_pass2(const int16_t *ring, int32_t *acc, int n)
+{
     for (int c = 0; c < REVERB_BLOCK; c += REVERB_ACC_CHUNK) {
-        int32_t a0 = accT0[c], a1 = accT0[c+1], a2 = accT0[c+2], a3 = accT0[c+3];
+        int32_t a0 = acc[c], a1 = acc[c+1], a2 = acc[c+2], a3 = acc[c+3];
 
         for (int i = 0; i < n; i++) {
             const uint32_t gab = t0_mod_gab[i];
-            const int16_t *src = &t0_ring[t0_mod_base[i] + (uint32_t)c];
+            const int16_t *src = &ring[t0_mod_base[i] + (uint32_t)c];
             a0 = qadd_sat(a0, smlad(*((const u32_alias *)(src + 0)), gab, 0));
             a1 = qadd_sat(a1, smlad(*((const u32_alias *)(src + 1)), gab, 0));
             a2 = qadd_sat(a2, smlad(*((const u32_alias *)(src + 2)), gab, 0));
             a3 = qadd_sat(a3, smlad(*((const u32_alias *)(src + 3)), gab, 0));
         }
 
-        accT0[c] = a0; accT0[c+1] = a1; accT0[c+2] = a2; accT0[c+3] = a3;
+        acc[c] = a0; acc[c+1] = a1; acc[c+2] = a2; acc[c+3] = a3;
     }
 }
 
@@ -3792,9 +3964,12 @@ static void do_bridge_t0_to_t1(void)
         host_note_sat(accT0[i], &host_dbg_t01_peak, &host_dbg_t01_sat);
 #endif
         t1_ring[wi & T1_RING_MASK] = soft_saturate_q15(accT0[i]);
+        t1_ring_r[wi & T1_RING_MASK] = soft_saturate_q15(accT0_r[i]);
         accT1[i] = 0;
+        accT1_r[i] = 0;
     }
     ring_guard_sync(t1_ring, T1_RING_SAMPLES);
+    ring_guard_sync(t1_ring_r, T1_RING_SAMPLES);
 }
 
 /* Per-tap window start, computed once per block. Same reason as T0's: with the
@@ -3802,23 +3977,21 @@ static void do_bridge_t0_to_t1(void)
  * the subtract and mask four times over — and cost a reload of block_write_idx
  * from the stack each time, which was enough register pressure to push two of
  * the four accumulators out to the stack as well. */
-static const int16_t *t1_tap_src[MAX_T1_TAPS] CCM_ATTR;
+static uint32_t t1_tap_base[MAX_T1_TAPS] CCM_ATTR;
 
-REVERB_CONV_FN static void do_t1_phase(void)
+/* One channel's T1, from the window starts in t1_tap_base. */
+REVERB_CONV_FN static void t1_conv(const int16_t *ring, int32_t *acc)
 {
     const int tapEnd = t1TapCount;
 
-    for (int t = 0; t < tapEnd; t++)
-        t1_tap_src[t] = &t1_ring[(block_write_idx - (uint32_t)effOffT1[t]) & T1_RING_MASK];
-
     for (int c = 0; c < REVERB_BLOCK; c += REVERB_ACC_CHUNK) {
-        int32_t a0 = accT1[c], a1 = accT1[c+1], a2 = accT1[c+2], a3 = accT1[c+3];
+        int32_t a0 = acc[c], a1 = acc[c+1], a2 = acc[c+2], a3 = acc[c+3];
 
         for (int t = 0; t < tapEnd; t++) {
             const uint32_t gain = (uint32_t)(int32_t)effGains_t1[t];
             /* Guard region makes this contiguous for every base — no wrap split,
              * and no odd-length segment to run off the end of. */
-            const int16_t *src = t1_tap_src[t] + c;
+            const int16_t *src = ring + t1_tap_base[t] + c;
             uint32_t p0 = *((const u32_alias *)(src));
             uint32_t p1 = *((const u32_alias *)(src + 2));
             a0 = qadd_sat(a0, smulbb(p0, gain));
@@ -3827,8 +4000,17 @@ REVERB_CONV_FN static void do_t1_phase(void)
             a3 = qadd_sat(a3, smultb(p1, gain));
         }
 
-        accT1[c] = a0; accT1[c+1] = a1; accT1[c+2] = a2; accT1[c+3] = a3;
+        acc[c] = a0; acc[c+1] = a1; acc[c+2] = a2; acc[c+3] = a3;
     }
+}
+
+REVERB_CONV_FN static void do_t1_phase(void)
+{
+    const int tapEnd = t1TapCount;
+    for (int t = 0; t < tapEnd; t++)
+        t1_tap_base[t] = (block_write_idx - (uint32_t)effOffT1[t]) & T1_RING_MASK;
+    t1_conv(t1_ring, accT1);
+    t1_conv(t1_ring_r, accT1_r);
 }
 
 /* Pre-T2 tanh saturation, applied to the T1->T2 bridge output as it is written
@@ -3877,6 +4059,13 @@ static inline int16_t pre_t2_sat(int16_t x)
 
 static void do_bridge_t1_to_t2(void)
 {
+    /* Cross-feed (STEREO_T2_XFEED), on the accumulators. */
+    for (int i = 0; i < REVERB_BLOCK; i++) {
+        const int32_t l = accT1[i], r = accT1_r[i];
+        const float d = STEREO_T2_XFEED * ((float)r - (float)l);
+        accT1[i]   = l + (int32_t)d;
+        accT1_r[i] = r - (int32_t)d;
+    }
     for (int i = 0; i < REVERB_BLOCK; i += 2) {
 #ifdef VELVET_REVERB_HOST
         host_note_sat(accT1[i],     &host_dbg_t12_peak, &host_dbg_t12_sat);
@@ -3887,6 +4076,10 @@ static void do_bridge_t1_to_t2(void)
         uint32_t packed = ((uint32_t)(uint16_t)s1 << 16) | (uint32_t)(uint16_t)s0;
         uint32_t wi = block_write_idx + (uint32_t)i;
         *((volatile u32_alias *)&t2_ring[wi & T2_RING_MASK]) = packed;
+        int16_t r0 = pre_t2_sat(soft_saturate_q15(accT1_r[i]));
+        int16_t r1 = pre_t2_sat(soft_saturate_q15(accT1_r[i + 1]));
+        packed = ((uint32_t)(uint16_t)r1 << 16) | (uint32_t)(uint16_t)r0;
+        *((volatile u32_alias *)&t2_ring_r[wi & T2_RING_MASK]) = packed;
     }
     for (int i = 0; i < REVERB_BLOCK; i++) { accL[i] = 0; accR[i] = 0; }
 }
@@ -4078,19 +4271,28 @@ static void do_finalize(void)
 /* ==== ISR-side: input buffer fill ==== */
 void velvet_reverb_push_sample(int16_t input)
 {
+    velvet_reverb_push_stereo(input, input);
+}
+
+void velvet_reverb_push_stereo(int16_t left, int16_t right)
+{
 #if REVERB_DECIM == 2
-    push_acc += input;
+    push_acc += left;
+    push_acc_r += right;
     push_phase ^= 1;
     if (push_phase) return;
 
     int16_t avg = (int16_t)(push_acc >> 1);
+    int16_t avg_r = (int16_t)(push_acc_r >> 1);
     push_acc = 0;
+    push_acc_r = 0;
 #else
-    int16_t avg = input;
+    int16_t avg = left, avg_r = right;
 #endif
 
     const uint32_t wseq = in_wr_seq;
     in_ring[wseq % REVERB_IN_NBUF][input_fill_idx] = avg;
+    in_ring_r[wseq % REVERB_IN_NBUF][input_fill_idx] = avg_r;
     input_fill_idx++;
 
     if (input_fill_idx >= REVERB_BLOCK) {
@@ -4173,7 +4375,7 @@ static void prof_verify_dma(void)
             if (t >= t2TapCount) continue;
             const uint32_t idx = (prof_t2_bw - t2_gather_off[r]) & T2_RING_MASK;
             for (int i = 0; i < REVERB_BLOCK; i++)
-                if (t2_gather[r][prof_t2_h + i] != t2_ring[(idx + (uint32_t)i) & T2_RING_MASK]) prof_dma_bad++;
+                if (t2_gather[r][prof_t2_h + i] != t2_row_ring(r)[(idx + (uint32_t)i) & T2_RING_MASK]) prof_dma_bad++;
             prof_dma_checks++;
         }
         r0 = (r0 + 8) % T2_GATHER_ROWS;
@@ -4350,6 +4552,7 @@ void velvet_reverb_poll(void)
     if (in_wr_seq - in_rd_seq > prof_queue_max) prof_queue_max = in_wr_seq - in_rd_seq;
 #endif
     input_ready = in_ring[in_rd_seq % REVERB_IN_NBUF];
+    input_ready_r = in_ring_r[in_rd_seq % REVERB_IN_NBUF];
 #if defined(DIAG_REVERB_PROFILE) && !defined(VELVET_REVERB_HOST)
     prof_step();
 #endif
@@ -4498,6 +4701,8 @@ void velvet_reverb_poll(void)
  * wrap so the cushion floats around TARGET_LAG, absorbing poll jitter. The
  * reader thus reads slot (rd_seq % NBUF): always a completed block, never the
  * writer's in-progress slot. */
+uint32_t velvet_reverb_blocks_done(void) { return blocks_produced; }
+
 int16_t velvet_reverb_out_left(void)
 {
     if (out_idx_L == 0) {

@@ -3,8 +3,11 @@
 //
 // The original granular main is kept as beads_granular.cc.orig.
 //
+// The reverb is stereo: each input feeds its own side, with a little
+// cross-feed so an off-centre sound fills both sides as it decays.
+//
 // Panel:
-//   TIME knob           Pre-delay: the whole reverb comes in up to 1 s after
+//   TIME knob           Pre-delay: the whole reverb comes in up to 0.68 s after
 //                       the dry signal (square law, short times get the
 //                       travel)
 //   SIZE knob           The space and its decay together, as the DLD's Decay
@@ -55,7 +58,7 @@
 //   VU LED              Input level
 //
 // Audio runs at 48 kHz in 12-frame blocks (4 kHz block rate). The reverb runs
-// at 24 kHz: its input is decimated in velvet_reverb_push_sample() and its
+// at 24 kHz, in stereo: its input is decimated in velvet_reverb_push_stereo() and its
 // 16-sample blocks are processed in the main loop, as on the DLD.
 //
 // Based on Beads by Emilie Gillet (MIT) and the DLD velvet reverb (MIT).
@@ -85,16 +88,38 @@ using namespace stmlib;
 const int kSampleRate = 48000;
 const int kBlockRate = 4000;
 
-// The reverb's big buffers. These sections are NOLOAD (never cleared at
-// start-up), so Init() zeroes them before the reverb starts.
-//   RAM_D1 (512 KiB): the T2 ring, 256 KiB at 24 kHz; the rest is free.
-//   RAM_D2 (256 KiB): the two float sustain-loop lines (128 KiB together) and
-//   the int16 input delay ring (64 KiB).
-// T0/T1 rings and all other reverb state are ordinary .bss, which is DTCM.
+// The reverb's big buffers, a left and a right of each. These sections are
+// NOLOAD (never cleared at start-up); velvet_reverb_init() zeroes them.
+//   RAM_D1 (512 KiB): the two T2 rings, 256 KiB each at 24 kHz.
+//   RAM_D2 (256 KiB): the four float sustain-loop lines, 64 KiB each.
+//   RAM_D3 (64 KiB): the two int16 input delay rings (TIME), 32 KiB each.
+// The left T0/T1 rings and all other reverb state are ordinary .bss (DTCM);
+// the right T0/T1 rings are in ITCM (see velvet_reverb.c).
 int16_t beads_t2_ring_storage[T2_RING_SAMPLES] __attribute__ ((section (".ramd1")));
+int16_t beads_t2_ring_r_storage[T2_RING_SAMPLES] __attribute__ ((section (".ramd1")));
 float beads_predelay_a_storage[PRE_DELAY_LINE_SAMPLES] __attribute__ ((section (".ramd2")));
 float beads_predelay_b_storage[PRE_DELAY_LINE_SAMPLES] __attribute__ ((section (".ramd2")));
-int16_t beads_input_delay_storage[INPUT_DELAY_SAMPLES] __attribute__ ((section (".ramd2")));
+float beads_predelay_a_r_storage[PRE_DELAY_LINE_SAMPLES] __attribute__ ((section (".ramd2")));
+float beads_predelay_b_r_storage[PRE_DELAY_LINE_SAMPLES] __attribute__ ((section (".ramd2")));
+int16_t beads_input_delay_storage[INPUT_DELAY_SAMPLES] __attribute__ ((section (".ramd3")));
+int16_t beads_input_delay_r_storage[INPUT_DELAY_SAMPLES] __attribute__ ((section (".ramd3")));
+
+// CPU readout, refreshed once a second, for reading over SWD without
+// stopping the module (st-flash --hot-plug read; see the address of
+// beads_cpu in build/beads/beads.map). Shares of the CPU in tenths of a
+// percent: the reverb's processing in the main loop, the audio interrupt,
+// their sum, and the busiest single reverb block as a share of the block's
+// 0.5 ms (a block that takes longer than that is late).
+struct BeadsCpu {
+  uint32_t magic;           // 0xC0FFEE01 once the first second is in
+  uint32_t reverb_permille;
+  uint32_t audio_permille;
+  uint32_t total_permille;
+  uint32_t peak_block_permille;
+  uint32_t seconds;
+};
+volatile BeadsCpu beads_cpu __attribute__ ((used)) = { 0, 0, 0, 0, 0, 0 };
+volatile uint32_t audio_cycles = 0;   // audio interrupt cycles, running total
 
 Codec codec;
 FreezeInput freeze_input;
@@ -265,6 +290,7 @@ void Process(
     const Codec::Frame* in,
     Codec::Frame* out,
     size_t size) {
+  const uint32_t process_start = DWT->CYCCNT;
   normalization_detector.Process(
       events[size - 1], in[size - 1], cv_reader.cv_values());
   cv_reader.Read();
@@ -374,10 +400,12 @@ void Process(
     } else if (r_open) {
       r = l;
     }
-    const float mono = 0.5f * (l + r);
-    peak = std::max(peak, fabsf(mono));
+    peak = std::max(peak, std::max(fabsf(l), fabsf(r)));
 
-    velvet_reverb_push_sample(SaturateInt16(mono * send * 32768.0f));
+    // Stereo in: each side feeds its own side of the reverb (a lone patched
+    // input has already been copied to both).
+    velvet_reverb_push_stereo(SaturateInt16(l * send * 32768.0f),
+                              SaturateInt16(r * send * 32768.0f));
     float out_l = l * dry + velvet_reverb_out_left() * (1.0f / 32768.0f);
     float out_r = r * dry + velvet_reverb_out_right() * (1.0f / 32768.0f);
     CONSTRAIN(out_l, -1.0f, 0.999999f);
@@ -386,6 +414,7 @@ void Process(
     out[i].r = static_cast<int32_t>(out_r * 2147483648.0f);
   }
   input_peak = peak;
+  audio_cycles += DWT->CYCCNT - process_start;
 }
 
 // DRY/WET pot -> send and dry gain, as on the DLD's right MIX pot: the send
@@ -421,13 +450,54 @@ void Init() {
   octave_jumps.Init();
 
   wet_fx_init(float(kSampleRate));
-  memset(beads_t2_ring_storage, 0, sizeof(beads_t2_ring_storage));
-  memset(beads_predelay_a_storage, 0, sizeof(beads_predelay_a_storage));
-  memset(beads_predelay_b_storage, 0, sizeof(beads_predelay_b_storage));
   velvet_reverb_init();
+
+  // The cycle counter, for the CPU readout.
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->LAR = 0xC5ACCE55;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
   ready = true;
   codec.Start(kSampleRate, kSampleRate / kBlockRate, &Process);
+}
+
+// Times one pass of velvet_reverb_poll() and folds it into beads_cpu.
+uint32_t cpu_window_start = 0, cpu_reverb_cycles = 0, cpu_audio_at_start = 0;
+uint32_t cpu_peak_cycles = 0;
+
+void PollAndMeasure() {
+  uint32_t& window_start = cpu_window_start;
+  uint32_t& reverb_cycles = cpu_reverb_cycles;
+  uint32_t& audio_at_start = cpu_audio_at_start;
+  uint32_t& peak_cycles = cpu_peak_cycles;
+  const uint32_t blocks = velvet_reverb_blocks_done();
+  const uint32_t audio0 = audio_cycles;
+  const uint32_t t0 = DWT->CYCCNT;
+  velvet_reverb_poll();
+  const uint32_t elapsed = DWT->CYCCNT - t0;
+  if (velvet_reverb_blocks_done() != blocks) {
+    const uint32_t own = elapsed - (audio_cycles - audio0);
+    reverb_cycles += own;
+    if (own > peak_cycles) peak_cycles = own;
+  }
+  const uint32_t window = DWT->CYCCNT - window_start;
+  if (window >= SystemCoreClock) {
+    const uint32_t audio = audio_cycles - audio_at_start;
+    const float per = 1000.0f / float(window);
+    // One reverb block is 12 samples at 24 kHz: 0.5 ms.
+    const float block_cycles = float(SystemCoreClock) * 0.0005f;
+    beads_cpu.reverb_permille = uint32_t(float(reverb_cycles) * per);
+    beads_cpu.audio_permille = uint32_t(float(audio) * per);
+    beads_cpu.total_permille = beads_cpu.reverb_permille + beads_cpu.audio_permille;
+    beads_cpu.peak_block_permille = uint32_t(float(peak_cycles) * 1000.0f / block_cycles);
+    beads_cpu.seconds = beads_cpu.seconds + 1;
+    beads_cpu.magic = 0xC0FFEE01u;
+    window_start = DWT->CYCCNT;
+    reverb_cycles = 0;
+    audio_at_start = audio_cycles;
+    peak_cycles = 0;
+  }
 }
 
 int main(void) {
@@ -447,6 +517,6 @@ int main(void) {
     velvet_reverb_set_freeze(frozen);
     velvet_reverb_set_reverse(reversed);
     UpdateMix();
-    velvet_reverb_poll();
+    PollAndMeasure();
   }
 }
