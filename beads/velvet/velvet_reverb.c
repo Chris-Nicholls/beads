@@ -781,8 +781,11 @@ void velvet_reverb_apply_size_macro   (float v) { PROF_PANEL_IGNORED(); set_macr
 
 /* ==== Morph alphas (per block, derived from per-tau / blocks-per-sec) ====
  * Block rate = fs_reverb / REVERB_BLOCK = 1500 Hz at either rate.
- *   tau ≈ 1/(α × 1500). 0.0219 → ~30 ms (window), 0.00664 → ~100 ms (decay). */
-#define ALPHA_WINDOW_MORPH   0.0219f
+ *   tau ≈ 1/(α × 1500). 0.0073 → ~90 ms (window), 0.00664 → ~100 ms (decay).
+ * The windows, tap counts and level comps follow Size and Density at ~90 ms:
+ * at the old ~30 ms a quick turn moved the gains far enough between
+ * recomputes to zip. */
+#define ALPHA_WINDOW_MORPH   0.0073f
 /* ==== Morph state ====
  * Windows morph (driven by the Size macro), tap counts morph (Density), and
  * the gain-comp morph tracks the resulting energy. */
@@ -894,6 +897,7 @@ typedef struct {
 } PdLen;
 static PdLen pre_len_a, pre_len_b, pre_len_a_r, pre_len_b_r;
 static float duck_env = 0.0f;
+static float fb_morph = -1.0f;     /* the loop feedback, gliding (see do_predelay); < 0 = unset */
 static Biquad pre_low_shelf_a CCM_ATTR, pre_high_shelf_a CCM_ATTR;
 static Biquad pre_low_shelf_b CCM_ATTR, pre_high_shelf_b CCM_ATTR;
 static Biquad pre_low_shelf_a_r CCM_ATTR, pre_high_shelf_a_r CCM_ATTR;
@@ -2037,6 +2041,7 @@ void velvet_reverb_init(void)
         loop_lfo_seed = 0x2545F491u;
     }
     duck_env = 0.0f;
+    fb_morph = -1.0f;
     pre_low_shelf_a.z1 = pre_low_shelf_a.z2 = 0.0f;
     pre_high_shelf_a.z1 = pre_high_shelf_a.z2 = 0.0f;
     pre_low_shelf_b.z1 = pre_low_shelf_b.z2 = 0.0f;
@@ -2386,6 +2391,38 @@ static void compute_tap_states_lr(const uint32_t *ladderL, const uint32_t *ladde
  * quiet, by up to 9 dB, whenever a quiet tap was carrying it. Returns the
  * make-up, >= 1. */
 static float t0_makeup = 1.0f, t1_makeup = 1.0f, t2_makeup_l = 1.0f, t2_makeup_r = 1.0f;
+
+/* Gain ramps. A stage's gains are recomputed every few blocks (one stage a
+ * block, in turn), and they used to jump there and hold for the block: when
+ * Size or Density moved, each stage's output stepped every 2 ms, heard as
+ * zipper noise. Now each recompute keeps the gains it replaces, and for the
+ * next GAIN_RAMP samples (until that stage's next recompute) the stage runs
+ * with both sets and crossfades from the old output to the new, so its gains
+ * move in a straight line. The cost is a second pass of that stage's taps
+ * while it ramps. */
+#define GAIN_RAMP  (3 * REVERB_BLOCK)
+static int16_t effGains_t0_prev[MAX_T0_TAPS] CCM_ATTR;
+static int16_t effGains_t1_prev[MAX_T1_TAPS] CCM_ATTR;
+static int16_t effGains_t2_prev[MAX_T2_TAPS] CCM_ATTR;
+static int16_t effGains_t2R_prev[MAX_T2_TAPS] CCM_ATTR;
+static float t0_makeup_prev = 1.0f, t1_makeup_prev = 1.0f, t2_makeup_l_prev = 1.0f, t2_makeup_r_prev = 1.0f;
+static int32_t t0_ramp_left = 0, t1_ramp_left = 0, t2_ramp_left = 0;   /* samples */
+/* The ramping stages' second outputs, from the old gains. */
+static int32_t accT0_p[REVERB_BLOCK] CCM_ATTR, accT0_r_p[REVERB_BLOCK] CCM_ATTR;
+static int32_t accT1_p[REVERB_BLOCK] CCM_ATTR, accT1_r_p[REVERB_BLOCK] CCM_ATTR;
+static int32_t accL_p[REVERB_BLOCK] CCM_ATTR, accR_p[REVERB_BLOCK] CCM_ATTR;
+
+/* How far through its ramp a stage is at sample n of this block, 0..1. */
+static inline float ramp_frac(int32_t left, int n)
+{
+    return (float)(GAIN_RAMP - left + n + 1) * (1.0f / (float)GAIN_RAMP);
+}
+/* A Q30 accumulator at full scale 1.0 with its make-up, crossfaded from the
+ * old gains' (p, mkp) to the new (x, mk) by f. */
+static inline float acc_blend(int32_t p, float mkp, int32_t x, float mk, float f)
+{
+    return ((float)p * mkp + f * ((float)x * mk - (float)p * mkp)) * (1.0f / 1073741824.0f);
+}
 static float stage_fit(float *g, int n, float scale)
 {
     float m = 0.0f;
@@ -2407,6 +2444,9 @@ static inline float density_comp(float full, float thinned)
 #define T0_TAPER_FRAC  0.15f
 static void recompute_eff_gains_t0(void)
 {
+    memcpy(effGains_t0_prev, effGains_t0, sizeof effGains_t0_prev);
+    t0_makeup_prev = t0_makeup;
+    t0_ramp_left = GAIN_RAMP;
     int count = t0TapCount;
     if (count <= 0) return;
 
@@ -2479,6 +2519,9 @@ static float t1_env_depth_db(float window)
 
 static void recompute_eff_gains_t1(void)
 {
+    memcpy(effGains_t1_prev, effGains_t1, sizeof effGains_t1_prev);
+    t1_makeup_prev = t1_makeup;
+    t1_ramp_left = GAIN_RAMP;
     int count = t1TapCount;
     if (count <= 0) return;
 
@@ -2546,6 +2589,10 @@ static void recompute_eff_gains_t1(void)
 
 static void recompute_eff_gains_t2(void)
 {
+    memcpy(effGains_t2_prev, effGains_t2, sizeof effGains_t2_prev);
+    memcpy(effGains_t2R_prev, effGains_t2R, sizeof effGains_t2R_prev);
+    t2_makeup_l_prev = t2_makeup_l; t2_makeup_r_prev = t2_makeup_r;
+    t2_ramp_left = GAIN_RAMP;
     int count = t2TapCount;
     if (count <= 0) return;
 
@@ -2691,7 +2738,7 @@ static void update_morph_state(void)
  * during long steady periods. */
 
 #define COMP_SETTLED  0.002f
-#define EFFGAINS_SETTLE_BLOCKS    60    /* ~40 ms of recompute after a target change */
+#define EFFGAINS_SETTLE_BLOCKS    180   /* ~120 ms of recompute after a target change (> the ~90 ms morph tau) */
 #define EFFGAINS_PERIODIC_BLOCKS  100   /* ~67 ms safety refresh interval */
 
 /* Per-target dead-bands. Set to "comfortably above ADC/morph noise floor"
@@ -3618,6 +3665,11 @@ static void do_predelay(void)
     float fb = reverb_feedback;
     if (fb > 0.999f) fb = 0.999f;
     if (fb < 0.0f) fb = 0.0f;
+    /* Size sets the loop's feedback directly; it glides here (~65 ms) so a
+     * turn does not step the gain of a recirculating loop every block. */
+    if (fb_morph < 0.0f) fb_morph = fb;
+    fb_morph += 0.01f * (fb - fb_morph);
+    fb = fb_morph;
 
     float timeA = predelay_a_morph;
     float timeB = predelay_b_morph;
@@ -3967,14 +4019,14 @@ static void accumulate_t0(const int16_t *ring, int32_t *acc, uint32_t base, uint
     }
 }
 
-REVERB_CONV_FN static void do_t0_phase_fast(void)
+REVERB_CONV_FN static void do_t0_phase_fast(const int16_t *gains, int32_t *accl, int32_t *accr)
 {
     int tapEnd = t0TapCount;
     for (int t = 0; t < tapEnd; t++) {
-        uint32_t gain = (uint32_t)(int32_t)effGains_t0[t];
+        uint32_t gain = (uint32_t)(int32_t)gains[t];
         uint32_t base = (block_write_idx - (uint32_t)effOffT0[t]) & T0_RING_MASK;
-        accumulate_t0(t0_ring, accT0, base, gain);
-        accumulate_t0(t0_ring_r, accT0_r, base, gain);
+        accumulate_t0(t0_ring, accl, base, gain);
+        accumulate_t0(t0_ring_r, accr, base, gain);
     }
 }
 
@@ -4009,7 +4061,7 @@ static uint32_t t0_mod_gab [MAX_T0_TAPS] CCM_ATTR;
  *   accT0[n] += g·rf · ring[ri_base-1+n] + g·(1-rf) · ring[ri_base+n] */
 REVERB_CONV_FN static void t0_mod_pass2(const int16_t *ring, int32_t *acc, int n);
 
-REVERB_CONV_FN static void do_t0_phase_mod(float depth)
+REVERB_CONV_FN static void do_t0_phase_mod(float depth, const int16_t *gains, int32_t *accl, int32_t *accr)
 {
     int tapEnd = t0TapCount;
     float ph0 = t0_tap_mod_phase;
@@ -4021,7 +4073,7 @@ REVERB_CONV_FN static void do_t0_phase_mod(float depth)
      * and the ordering is what makes the saturating accumulation bit-exact. */
     int n = 0;
     for (int t = 0; t < tapEnd; t++) {
-        int32_t g = (int32_t)effGains_t0[t];
+        int32_t g = (int32_t)gains[t];
         if (g == 0) continue;
         /* per-tap LFO sin (rotate base phase by the tap's golden-angle offset) */
         float s = sinP0 * t0TapModCos[t] + cosP0 * t0TapModSin[t];
@@ -4043,8 +4095,8 @@ REVERB_CONV_FN static void do_t0_phase_mod(float depth)
      * The internal sum cannot overflow: |ring·ga + ring·gb| <= 32767·(ga+gb)
      * = 32767·g <= 32767². The guard region makes the (REVERB_BLOCK+1)-sample
      * window contiguous for every base, so there is no wrap test and no gather. */
-    t0_mod_pass2(t0_ring, accT0, n);
-    t0_mod_pass2(t0_ring_r, accT0_r, n);
+    t0_mod_pass2(t0_ring, accl, n);
+    t0_mod_pass2(t0_ring_r, accr, n);
 }
 
 /* Pass 2 of do_t0_phase_mod for one channel's ring, from pass 1's taps. */
@@ -4072,13 +4124,17 @@ static void do_t0_phase(void)
     if (depth < 0.0f) depth = 0.0f; if (depth > 1.0f) depth = 1.0f;
     depth += mod_amount_morph * (1.0f - depth);
     depth *= T0_TAP_MOD_MAX_SAMPLES;
+    if (t0_ramp_left > 0)
+        for (int i = 0; i < REVERB_BLOCK; i++) accT0_p[i] = accT0_r_p[i] = 0;
     if (depth <= 0.0f) {
-        do_t0_phase_fast();
+        do_t0_phase_fast(effGains_t0, accT0, accT0_r);
+        if (t0_ramp_left > 0) do_t0_phase_fast(effGains_t0_prev, accT0_p, accT0_r_p);
         return;
     }
     float rate = reverb_t0_tap_mod_rate; if (rate < 0.0f) rate = 0.0f;
     float inc = TWO_PI_F * rate / (float)REVERB_FS_HZ;
-    do_t0_phase_mod(depth);
+    do_t0_phase_mod(depth, effGains_t0, accT0, accT0_r);
+    if (t0_ramp_left > 0) do_t0_phase_mod(depth, effGains_t0_prev, accT0_p, accT0_r_p);
     /* Advance the shared LFO phase by the block. */
     t0_tap_mod_phase += (float)REVERB_BLOCK * inc;
     t0_tap_mod_phase = fmodf(t0_tap_mod_phase, TWO_PI_F);
@@ -4092,11 +4148,18 @@ static void do_bridge_t0_to_t1(void)
 #ifdef VELVET_REVERB_HOST
         host_note_sat(accT0[i], &host_dbg_t01_peak, &host_dbg_t01_sat);
 #endif
-        t1_ring[wi & T1_RING_MASK] = soft_saturate_q15_g(accT0[i], t0_makeup);
-        t1_ring_r[wi & T1_RING_MASK] = soft_saturate_q15_g(accT0_r[i], t0_makeup);
+        if (t0_ramp_left > 0) {
+            const float f = ramp_frac(t0_ramp_left, i);
+            t1_ring[wi & T1_RING_MASK] = (int16_t)(soft_clip_unit(acc_blend(accT0_p[i], t0_makeup_prev, accT0[i], t0_makeup, f)) * 32767.0f);
+            t1_ring_r[wi & T1_RING_MASK] = (int16_t)(soft_clip_unit(acc_blend(accT0_r_p[i], t0_makeup_prev, accT0_r[i], t0_makeup, f)) * 32767.0f);
+        } else {
+            t1_ring[wi & T1_RING_MASK] = soft_saturate_q15_g(accT0[i], t0_makeup);
+            t1_ring_r[wi & T1_RING_MASK] = soft_saturate_q15_g(accT0_r[i], t0_makeup);
+        }
         accT1[i] = 0;
         accT1_r[i] = 0;
     }
+    t0_ramp_left = t0_ramp_left > REVERB_BLOCK ? t0_ramp_left - REVERB_BLOCK : 0;
     ring_guard_sync(t1_ring, T1_RING_SAMPLES);
     ring_guard_sync(t1_ring_r, T1_RING_SAMPLES);
 }
@@ -4109,7 +4172,7 @@ static void do_bridge_t0_to_t1(void)
 static uint32_t t1_tap_base[MAX_T1_TAPS] CCM_ATTR;
 
 /* One channel's T1, from the window starts in t1_tap_base. */
-REVERB_CONV_FN static void t1_conv(const int16_t *ring, int32_t *acc)
+REVERB_CONV_FN static void t1_conv(const int16_t *ring, int32_t *acc, const int16_t *gains)
 {
     const int tapEnd = t1TapCount;
 
@@ -4117,7 +4180,7 @@ REVERB_CONV_FN static void t1_conv(const int16_t *ring, int32_t *acc)
         int32_t a0 = acc[c], a1 = acc[c+1], a2 = acc[c+2], a3 = acc[c+3];
 
         for (int t = 0; t < tapEnd; t++) {
-            const uint32_t gain = (uint32_t)(int32_t)effGains_t1[t];
+            const uint32_t gain = (uint32_t)(int32_t)gains[t];
             /* Guard region makes this contiguous for every base — no wrap split,
              * and no odd-length segment to run off the end of. */
             const int16_t *src = ring + t1_tap_base[t] + c;
@@ -4138,8 +4201,13 @@ REVERB_CONV_FN static void do_t1_phase(void)
     const int tapEnd = t1TapCount;
     for (int t = 0; t < tapEnd; t++)
         t1_tap_base[t] = (block_write_idx - (uint32_t)effOffT1[t]) & T1_RING_MASK;
-    t1_conv(t1_ring, accT1);
-    t1_conv(t1_ring_r, accT1_r);
+    t1_conv(t1_ring, accT1, effGains_t1);
+    t1_conv(t1_ring_r, accT1_r, effGains_t1);
+    if (t1_ramp_left > 0) {
+        for (int i = 0; i < REVERB_BLOCK; i++) accT1_p[i] = accT1_r_p[i] = 0;
+        t1_conv(t1_ring, accT1_p, effGains_t1_prev);
+        t1_conv(t1_ring_r, accT1_r_p, effGains_t1_prev);
+    }
 }
 
 /* Pre-T2 tanh saturation, applied to the T1->T2 bridge output as it is written
@@ -4188,25 +4256,36 @@ static inline int16_t pre_t2_sat(int16_t x)
 
 static void do_bridge_t1_to_t2(void)
 {
-    /* Cross-feed (STEREO_T2_XFEED), on the accumulators. */
+    /* T1's output at full scale 1.0 (crossfaded while its gains ramp), the
+     * cross-feed between the sides (STEREO_T2_XFEED), then the soft clip and
+     * pre-T2 saturation into the T2 rings. */
+    float vl[REVERB_BLOCK], vr[REVERB_BLOCK];
     for (int i = 0; i < REVERB_BLOCK; i++) {
-        const int32_t l = accT1[i], r = accT1_r[i];
-        const float d = STEREO_T2_XFEED * ((float)r - (float)l);
-        accT1[i]   = l + (int32_t)d;
-        accT1_r[i] = r - (int32_t)d;
-    }
-    for (int i = 0; i < REVERB_BLOCK; i += 2) {
 #ifdef VELVET_REVERB_HOST
-        host_note_sat(accT1[i],     &host_dbg_t12_peak, &host_dbg_t12_sat);
-        host_note_sat(accT1[i + 1], &host_dbg_t12_peak, &host_dbg_t12_sat);
+        host_note_sat(accT1[i], &host_dbg_t12_peak, &host_dbg_t12_sat);
 #endif
-        int16_t s0 = pre_t2_sat(soft_saturate_q15_g(accT1[i], t1_makeup));
-        int16_t s1 = pre_t2_sat(soft_saturate_q15_g(accT1[i + 1], t1_makeup));
+        float l, r;
+        if (t1_ramp_left > 0) {
+            const float f = ramp_frac(t1_ramp_left, i);
+            l = acc_blend(accT1_p[i], t1_makeup_prev, accT1[i], t1_makeup, f);
+            r = acc_blend(accT1_r_p[i], t1_makeup_prev, accT1_r[i], t1_makeup, f);
+        } else {
+            l = (float)accT1[i] * (t1_makeup * (1.0f / 1073741824.0f));
+            r = (float)accT1_r[i] * (t1_makeup * (1.0f / 1073741824.0f));
+        }
+        const float d = STEREO_T2_XFEED * (r - l);
+        vl[i] = l + d;
+        vr[i] = r - d;
+    }
+    t1_ramp_left = t1_ramp_left > REVERB_BLOCK ? t1_ramp_left - REVERB_BLOCK : 0;
+    for (int i = 0; i < REVERB_BLOCK; i += 2) {
+        int16_t s0 = pre_t2_sat((int16_t)(soft_clip_unit(vl[i]) * 32767.0f));
+        int16_t s1 = pre_t2_sat((int16_t)(soft_clip_unit(vl[i + 1]) * 32767.0f));
         uint32_t packed = ((uint32_t)(uint16_t)s1 << 16) | (uint32_t)(uint16_t)s0;
         uint32_t wi = block_write_idx + (uint32_t)i;
         *((volatile u32_alias *)&t2_ring[wi & T2_RING_MASK]) = packed;
-        int16_t r0 = pre_t2_sat(soft_saturate_q15_g(accT1_r[i], t1_makeup));
-        int16_t r1 = pre_t2_sat(soft_saturate_q15_g(accT1_r[i + 1], t1_makeup));
+        int16_t r0 = pre_t2_sat((int16_t)(soft_clip_unit(vr[i]) * 32767.0f));
+        int16_t r1 = pre_t2_sat((int16_t)(soft_clip_unit(vr[i + 1]) * 32767.0f));
         packed = ((uint32_t)(uint16_t)r1 << 16) | (uint32_t)(uint16_t)r0;
         *((volatile u32_alias *)&t2_ring_r[wi & T2_RING_MASK]) = packed;
     }
@@ -4230,6 +4309,11 @@ static void do_t2_phase(void)
 #endif
         t2_conv_blocked(&t2_gather[0][h],           accL, count, effGains_t2);
         t2_conv_blocked(&t2_gather[MAX_T2_TAPS][h], accR, count, T2_GAINS_R);
+        if (t2_ramp_left > 0) {
+            for (int i = 0; i < REVERB_BLOCK; i++) accL_p[i] = accR_p[i] = 0;
+            t2_conv_blocked(&t2_gather[0][h],           accL_p, count, effGains_t2_prev);
+            t2_conv_blocked(&t2_gather[MAX_T2_TAPS][h], accR_p, count, effGains_t2R_prev);
+        }
     }
 }
 
@@ -4288,8 +4372,15 @@ static void do_finalize(void)
     /* Baseline for A/B, both sonic and for cycle counting: the pre-limiter output
      * path, writing straight through with no look-ahead buffer, peak scan or gain. */
     for (int i = 0; i < REVERB_BLOCK; i++) {
-        float rawL = (float)soft_saturate_q15_g(accL[i], t2_makeup_l) * REVERB_OUT_MAKEUP;
-        float rawR = (float)soft_saturate_q15_g(accR[i], t2_makeup_r) * REVERB_OUT_MAKEUP;
+        float rawL, rawR;
+        if (t2_ramp_left > 0) {
+            const float f = ramp_frac(t2_ramp_left, i);
+            rawL = soft_clip_unit(acc_blend(accL_p[i], t2_makeup_l_prev, accL[i], t2_makeup_l, f)) * (REVERB_OUT_MAKEUP * 32767.0f);
+            rawR = soft_clip_unit(acc_blend(accR_p[i], t2_makeup_r_prev, accR[i], t2_makeup_r, f)) * (REVERB_OUT_MAKEUP * 32767.0f);
+        } else {
+            rawL = (float)soft_saturate_q15_g(accL[i], t2_makeup_l) * REVERB_OUT_MAKEUP;
+            rawR = (float)soft_saturate_q15_g(accR[i], t2_makeup_r) * REVERB_OUT_MAKEUP;
+        }
         float m = 0.5f * (rawL + rawR);
         float s = 0.5f * (rawL - rawR) * REVERB_STEREO_WIDTH;
         float curL = m + s;
@@ -4325,8 +4416,15 @@ static void do_finalize(void)
         host_note_sat(accL[i], &host_dbg_out_peak, &host_dbg_out_sat);
         host_note_sat(accR[i], &host_dbg_out_peak, &host_dbg_out_sat);
 #endif
-        float rawL = (float)soft_saturate_q15_g(accL[i], t2_makeup_l) * (REVERB_OUT_MAKEUP / 32768.0f);
-        float rawR = (float)soft_saturate_q15_g(accR[i], t2_makeup_r) * (REVERB_OUT_MAKEUP / 32768.0f);
+        float rawL, rawR;
+        if (t2_ramp_left > 0) {
+            const float f = ramp_frac(t2_ramp_left, i);
+            rawL = soft_clip_unit(acc_blend(accL_p[i], t2_makeup_l_prev, accL[i], t2_makeup_l, f)) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
+            rawR = soft_clip_unit(acc_blend(accR_p[i], t2_makeup_r_prev, accR[i], t2_makeup_r, f)) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
+        } else {
+            rawL = (float)soft_saturate_q15_g(accL[i], t2_makeup_l) * (REVERB_OUT_MAKEUP / 32768.0f);
+            rawR = (float)soft_saturate_q15_g(accR[i], t2_makeup_r) * (REVERB_OUT_MAKEUP / 32768.0f);
+        }
         float m = 0.5f * (rawL + rawR);
         float s = 0.5f * (rawL - rawR) * REVERB_STEREO_WIDTH;
         float curL = m + s;
@@ -4391,6 +4489,8 @@ static void do_finalize(void)
     prev_out_L = pL;
     prev_out_R = pR;
 #endif
+
+    t2_ramp_left = t2_ramp_left > REVERB_BLOCK ? t2_ramp_left - REVERB_BLOCK : 0;
 
     /* Publish: the block is fully written before blocks_produced exposes it. */
     __DMB();
