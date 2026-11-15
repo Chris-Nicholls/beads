@@ -1029,9 +1029,7 @@ volatile uint8_t input_queue_max = 0;
  * how long it sat before the main loop picked it up. */
 static volatile uint32_t blocks_produced   = 0;
 static volatile uint32_t output_miss_count = 0;
-#ifdef DIAG_REVERB_PROFILE
-static volatile uint32_t output_miss_count_r = 0;   /* the right reader's, reported by profile builds */
-#endif
+static volatile uint32_t output_miss_count_r = 0;   /* the right reader's */
 /* Input blocks discarded because poll had not consumed the previous one. See
  * the drop path in velvet_reverb_push_sample. */
 volatile uint32_t input_drop_count = 0;
@@ -1100,10 +1098,10 @@ static int32_t accR [REVERB_BLOCK] CCM_ATTR;
  * slow ones, so a run of late/slow polls no longer starves it. Only when the
  * cushion is fully drained (TARGET_LAG consecutive misses) does a real bitcrush
  * occur. NBUF > TARGET_LAG keeps a guard slot so the writer can never overwrite
- * a block being read. Costs TARGET_LAG blocks of latency (~2.7 ms — inaudible
+ * a block being read. Costs TARGET_LAG blocks of latency (~5.3 ms, inaudible
  * on a reverb tail). */
-#define REVERB_OUT_NBUF        8
-#define REVERB_OUT_TARGET_LAG  4
+#define REVERB_OUT_NBUF        16
+#define REVERB_OUT_TARGET_LAG  8   /* 5.3 ms: on the Beads the main loop can be a few ms late */
 static int16_t outL[REVERB_OUT_NBUF][REVERB_OUT_BLOCK] CCM_ATTR;
 static int16_t outR[REVERB_OUT_NBUF][REVERB_OUT_BLOCK] CCM_ATTR;
 /* Per-channel read sequence + cached slot. The two codec ISRs wrap
@@ -1112,6 +1110,7 @@ static int16_t outR[REVERB_OUT_NBUF][REVERB_OUT_BLOCK] CCM_ATTR;
 static uint32_t rd_seq_L = 0;
 static uint32_t rd_seq_R = 0;
 static uint8_t  reader_buf_L = 0;
+static uint8_t  reader_started_L = 0, reader_started_R = 0;   /* see out_next_block */
 static uint8_t  reader_buf_R = 0;
 static uint8_t  out_idx_L = 0;
 static uint8_t  out_idx_R = 0;
@@ -1998,6 +1997,7 @@ void velvet_reverb_init(void)
     blocks_produced = 0;
     rd_seq_L = 0; rd_seq_R = 0;
     reader_buf_L = 0; reader_buf_R = 0;
+    reader_started_L = reader_started_R = 0;
     out_idx_L = 0; out_idx_R = 0;
 
     /* Biquads */
@@ -4822,8 +4822,8 @@ void velvet_reverb_poll(void)
  * Lag policy (let newest = blocks_produced - 1 = newest published block, and
  * lag = newest - rd_seq = completed blocks buffered ahead of the reader):
  *   - advance the read sequence by one block per wrap;
- *   - if it passes newest (underrun: cushion fully drained), clamp to newest
- *     and count an output_miss (replays one block);
+ *   - if it passes newest (underrun: cushion fully drained), go back to
+ *     TARGET_LAG behind and count an output_miss;
  *   - if lag grows beyond NBUF-1 (writer about to lap the reader), resync to
  *     the target lag, dropping stale audio.
  * Crucially the reader does NOT hug newest — it free-runs at one block per
@@ -4837,25 +4837,37 @@ void velvet_reverb_overruns(uint32_t *drops, uint32_t *misses)
     *misses = output_miss_count;
 }
 
-int16_t velvet_reverb_out_left(void)
+/* One reader's step to its next block. The reader waits until TARGET_LAG + 1
+ * blocks exist and then starts TARGET_LAG behind the newest, so the cushion
+ * the ring is for is really there: without that it started at the newest
+ * block and stayed within one or two of it, so any poll more than a block
+ * late replayed a block (heard as repeated fragments in sparse echoes). If
+ * the cushion is ever used up, it goes back to TARGET_LAG behind rather than
+ * hugging the newest. Until it starts it plays silence (slot 0, cleared). */
+static inline uint8_t out_next_block(uint32_t *rd_seq, uint8_t *started, volatile uint32_t *misses)
 {
-    if (out_idx_L == 0) {
-        uint32_t wr = blocks_produced;
-        if (wr != 0u) {
-            uint32_t newest = wr - 1u;
-            rd_seq_L++;
-            int32_t lag = (int32_t)(newest - rd_seq_L);
-            if (lag < 0) {
-                rd_seq_L = newest;
-#ifndef VELVET_REVERB_HOST
-                output_miss_count++;
-#endif
-            } else if (lag > (REVERB_OUT_NBUF - 1)) {
-                rd_seq_L = newest - REVERB_OUT_TARGET_LAG;
-            }
-            reader_buf_L = (uint8_t)(rd_seq_L % REVERB_OUT_NBUF);
+    const uint32_t wr = blocks_produced;
+    if (wr <= (uint32_t)REVERB_OUT_TARGET_LAG) return 0;
+    const uint32_t newest = wr - 1u;
+    if (!*started) {
+        *started = 1;
+        *rd_seq = newest - REVERB_OUT_TARGET_LAG;
+    } else {
+        (*rd_seq)++;
+        const int32_t lag = (int32_t)(newest - *rd_seq);
+        if (lag < 0) {
+            *rd_seq = newest - REVERB_OUT_TARGET_LAG;
+            (*misses)++;
+        } else if (lag > (REVERB_OUT_NBUF - 1)) {
+            *rd_seq = newest - REVERB_OUT_TARGET_LAG;
         }
     }
+    return (uint8_t)(*rd_seq % REVERB_OUT_NBUF);
+}
+
+int16_t velvet_reverb_out_left(void)
+{
+    if (out_idx_L == 0) reader_buf_L = out_next_block(&rd_seq_L, &reader_started_L, &output_miss_count);
     int16_t s = outL[reader_buf_L][out_idx_L];
     out_idx_L = (uint8_t)((out_idx_L + 1) & (REVERB_OUT_BLOCK - 1));
     return s;
@@ -4863,23 +4875,7 @@ int16_t velvet_reverb_out_left(void)
 
 int16_t velvet_reverb_out_right(void)
 {
-    if (out_idx_R == 0) {
-        uint32_t wr = blocks_produced;
-        if (wr != 0u) {
-            uint32_t newest = wr - 1u;
-            rd_seq_R++;
-            int32_t lag = (int32_t)(newest - rd_seq_R);
-            if (lag < 0) {
-                rd_seq_R = newest;
-#if defined(DIAG_REVERB_PROFILE) && !defined(VELVET_REVERB_HOST)
-                output_miss_count_r++;
-#endif
-            } else if (lag > (REVERB_OUT_NBUF - 1)) {
-                rd_seq_R = newest - REVERB_OUT_TARGET_LAG;
-            }
-            reader_buf_R = (uint8_t)(rd_seq_R % REVERB_OUT_NBUF);
-        }
-    }
+    if (out_idx_R == 0) reader_buf_R = out_next_block(&rd_seq_R, &reader_started_R, &output_miss_count_r);
     int16_t s = outR[reader_buf_R][out_idx_R];
     out_idx_R = (uint8_t)((out_idx_R + 1) & (REVERB_OUT_BLOCK - 1));
     return s;
