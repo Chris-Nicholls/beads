@@ -905,7 +905,13 @@ static float pre_hp_a_r = 0.0f, pre_hp_b_r = 0.0f;
 /* Per-line fractional-read state (see PREDELAY_READ): the allpass's last input
  * and output at 24 kHz, the cubic's four-sample window at 48 kHz. */
 #if REVERB_DECIM == 2
-typedef struct { float prev_in, prev_out; } PdReadState;
+typedef struct {
+    float prev_in, prev_out;   /* the allpass: last input and output */
+    int32_t i;                 /* its sample index at the last read (INT32_MIN: none yet) */
+    float b_in, b_out;         /* the second allpass, during a crossing */
+    int32_t bi;
+    int32_t xf;                /* crossing fade samples left, 0 = none */
+} PdReadState;
 #else
 typedef struct { int32_t i; float y0, y1, y2, y3; } PdReadState;
 #endif
@@ -2071,6 +2077,7 @@ void velvet_reverb_init(void)
     memset(&pre_rd_b, 0, sizeof pre_rd_b);
     memset(&pre_rd_a_r, 0, sizeof pre_rd_a_r);
     memset(&pre_rd_b_r, 0, sizeof pre_rd_b_r);
+    pre_rd_a.i = pre_rd_b.i = pre_rd_a_r.i = pre_rd_b_r.i = INT32_MIN;
     {
         static const float ph0[4] = { 0.1f, 0.45f, 0.7f, 1.3f };   /* Cosmos's starting phases */
         for (int j = 0; j < 4; j++) {
@@ -2996,35 +3003,100 @@ __attribute__((always_inline)) static inline float read_ring_interp(const float 
  * frac = 0.5 would step a from +1/3 to -1/5 while both sides agree on the
  * position, which is a filter discontinuity, i.e. a click.
  *
- * Continuous in frac is not the same as clean under modulation, though: see
- * read_ring_cubic for the hiss this reader makes, and why 48 kHz does not use
- * it. At 24 kHz the cubic's own loss (above) would dull every tail. */
+ * Continuous in frac is not the same as continuous in time, though. The read
+ * moves on by one sample per sample, and the loop modulation drifts it across
+ * a whole sample now and then (about 30 times a second per line at the stock
+ * depth). There frac wraps from 1 to 0, the sample read moves on by one more,
+ * and the allpass's delay near Nyquist (always one sample, whatever frac) jumps
+ * by a whole sample. The loop recirculates those jumps as broadband hiss: on a
+ * sine at bright Tone, 56 dB under the tone from 1 to 8 kHz, against 68 dB
+ * with the loop modulation off.
+ *
+ * So a crossing is crossfaded. The allpass that was running carries on past
+ * the boundary on its old sample (its frac then a little outside [0, 1), where
+ * it stays well conditioned: d between about 0.65 and 2.4), a second one
+ * starts on the new sample, primed with the first one's last output so it
+ * starts settled, and the output fades from the first to the second over
+ * PD_AP_XFADE samples. The read moves at most ~0.35 of a sample during a fade
+ * even at full modulation. A jump bigger than that (a loop length step, a
+ * reset) starts over on the new sample. */
+#define PD_AP_XFADE  32
+__attribute__((always_inline)) static inline
+float ap_read_step(const float *buf, uint32_t mask, int32_t i, float f, float *pin, float *pout)
+{
+    const float x = buf[((uint32_t)i + 2u) & mask];
+    const float a = (f - 1.0f) / (3.0f - f);
+    const float y = a * (x - *pout) + *pin;
+    *pin = x; *pout = y;
+    return y;
+}
+
+/* a - b as a ring offset in [-N/2, N/2), N = mask + 1: the read position is
+ * a ring index, so it wraps when the write index does. */
+__attribute__((always_inline)) static inline
+int32_t ring_diff(int32_t a, int32_t b, uint32_t mask)
+{
+    const uint32_t h = (mask >> 1) + 1u;
+    return (int32_t)((((uint32_t)a - (uint32_t)b) + h) & mask) - (int32_t)h;
+}
+
 __attribute__((always_inline)) static inline
 float read_ring_allpass(const float *buf, uint32_t mask, float pos, PdReadState *st)
 {
     int32_t i = (int32_t)pos;
-    float f = pos - (float)i;
-    if (f < 0.0f) { f += 1.0f; i -= 1; }
-    float x = buf[((uint32_t)i + 2u) & mask];
-    float a = (f - 1.0f) / (3.0f - f);
-    float y = a * (x - st->prev_out) + st->prev_in;
-    st->prev_in = x; st->prev_out = y;
-    return y;
+    if ((float)i > pos) i -= 1;                 /* floor */
+    if (st->i == INT32_MIN) {
+        st->i = i;
+        st->xf = 0;
+        return ap_read_step(buf, mask, i, pos - (float)i, &st->prev_in, &st->prev_out);
+    }
+    /* Where the running allpass reads now (one on from its last read), in
+     * pos's frame. */
+    const int32_t ia = i - ring_diff(i, st->i + 1, mask);
+    const float fa = pos - (float)ia;
+    if (st->xf == 0) {
+        if (ia == i) {
+            st->i = ia;
+            return ap_read_step(buf, mask, ia, fa, &st->prev_in, &st->prev_out);
+        }
+        if (fa < -0.5f || fa >= 1.5f) {
+            st->i = i;
+            return ap_read_step(buf, mask, i, pos - (float)i, &st->prev_in, &st->prev_out);
+        }
+        /* A crossing: start the second allpass on the new sample. */
+        st->bi = i - 1;
+        st->b_in = buf[((uint32_t)i + 1u) & mask];
+        st->b_out = st->prev_out;
+        st->xf = PD_AP_XFADE;
+    }
+    const int32_t ib = i - ring_diff(i, st->bi + 1, mask);
+    const float fb = pos - (float)ib;
+    if (fa < -0.5f || fa >= 1.5f || fb < -0.5f || fb >= 1.5f) {
+        /* Moved too far during the fade for either to stay conditioned. */
+        st->xf = 0;
+        st->i = i;
+        return ap_read_step(buf, mask, i, pos - (float)i, &st->prev_in, &st->prev_out);
+    }
+    const float ya = ap_read_step(buf, mask, ia, fa, &st->prev_in, &st->prev_out);
+    const float yb = ap_read_step(buf, mask, ib, fb, &st->b_in, &st->b_out);
+    st->i = ia;
+    st->bi = ib;
+    const float t = (float)(PD_AP_XFADE - st->xf + 1) * (1.0f / (float)PD_AP_XFADE);
+    if (--st->xf == 0) {
+        st->i = ib;
+        st->prev_in = st->b_in;
+        st->prev_out = st->b_out;
+    }
+    return ya + t * t * (3.0f - 2.0f * t) * (yb - ya);
 }
 #else
 /* Fractional read via a 4-point cubic (Catmull-Rom), for the pre-delay feedback
  * lines at 48 kHz.
  *
- * The allpass above is flat in magnitude but gets the delay right only at low
- * frequencies: towards Nyquist its delay sits near a whole sample whatever frac
- * is. Under the loop modulation the read position crosses a whole sample about
- * 20 times a second per line, and at each crossing the high-frequency delay
- * jumps. The loop sustains those jumps as broadband hiss, which Tone exposes as
- * it opens the output LPF towards 20 kHz. On a sine pluck at Tone max the
- * allpass leaves a broadband floor about 50 dB under the tail; this cubic,
- * 65-70 dB.
- * Interpolating FIRs like this one have no such jumps: at frac -> 1 and at the
- * next index with frac = 0 they read the same sample.
+ * The allpass above is flat in magnitude but its high-frequency delay jumps a
+ * whole sample at each crossing, which it has to crossfade. Interpolating FIRs
+ * like this one have no such jumps: at frac -> 1 and at the next index with
+ * frac = 0 they read the same sample.
  *
  * At 48 kHz the cubic's per-traversal loss, which ruled it out at 24 kHz, has
  * moved up an octave: nothing measurable through 12 kHz, about 1.1 dB per
@@ -3400,6 +3472,8 @@ static void pd_len_update(PdLen *len, float target)
     len->left = PD_LEN_XFADE;
 #if REVERB_DECIM == 2
     len->rs.prev_in = len->rs.prev_out = 0.0f;   /* faded in from 0, so its start is silent */
+    len->rs.i = INT32_MIN;
+    len->rs.xf = 0;
 #else
     len->rs.i = INT32_MIN;                       /* the first read fills the window */
 #endif
