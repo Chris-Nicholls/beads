@@ -448,8 +448,7 @@ void velvet_reverb_set_modulation(float amount)
  * peaks, recirc feedback, etc.) now sit below it, so the soft knee (below)
  * rarely engages and the path stays transparent until a true over. Cost: the internal computation runs ~6 dB closer to the int16 LSB at
  * 0.5, so the quietest tail loses ~1 bit of SNR. Raise toward 1.0 if the decay
- * sounds grainy; lower toward 0.5 if clipping persists. The pre-T2 saturator is
- * gain-compensated (see pre_t2_sat) so its drive/character is unchanged. */
+ * sounds grainy; lower toward 0.5 if clipping persists. */
 /* On the Beads the reverb takes the codec input raw, with no input gain
  * control, so a held, bright modular signal at full send overran the stage
  * bridges' soft knees (thousands of hits a second at 0.5 of full scale with
@@ -1147,6 +1146,11 @@ static float   lim_buf_R[2][REVERB_OUT_BLOCK] CCM_ATTR;
 static uint8_t lim_phase = 0;
 static float   lim_gain = 1.0f;         /* gain at the last block boundary */
 static float   lim_gain_target = 1.0f;
+/* Each block's wanted gain over the last LIM_HOLD_BLOCKS, for the hold (see
+ * LIM_HOLD_BLOCKS). */
+#define LIM_HOLD_BLOCKS 24
+static float   lim_hold[LIM_HOLD_BLOCKS];
+static uint8_t lim_hold_idx = 0;
 
 /* ==== PRNG ==== */
 static uint32_t prng_state = 0xDEADBEEF;
@@ -2006,6 +2010,8 @@ void velvet_reverb_init(void)
     }
     lim_phase = 0;
     lim_gain = 1.0f; lim_gain_target = 1.0f;
+    for (int i = 0; i < LIM_HOLD_BLOCKS; i++) lim_hold[i] = 1.0f;
+    lim_hold_idx = 0;
     push_acc = push_acc_r = 0; push_phase = 0;
     in_wr_seq = 0; in_rd_seq = 0;
     input_fill_idx = 0;
@@ -4271,68 +4277,19 @@ REVERB_CONV_FN static void do_t1_phase(void)
     }
 }
 
-/* Pre-T2 tanh saturation, applied to the T1->T2 bridge output as it is written
- * to t2_ring, so every T2 tap read sees the saturated signal. (No T2 read in a
- * block touches the block being written: every tap is at least TAP_MIN_OFFSET
- * back.) Pregain drives the tanh; postgain trims the result.
- * Values are hardcoded to the user's chosen 2.0 / 0.5; expose as globals
- * later if they need to tweak. */
-#ifndef SAT_PRE_T2_PREGAIN
-#define SAT_PRE_T2_PREGAIN   1.1f
-#endif
-#ifndef SAT_PRE_T2_POSTGAIN
-#define SAT_PRE_T2_POSTGAIN  1.05f
-#endif
-
-/* Padé(3,2) approximation of tanh: x(27 + x²) / (27 + 9x²).
- * Accurate to <0.001 for |x| ≤ 2 (well below audible). Asymptotes to ±1/3 ×
- * sign(x) → 0.333 instead of ±1 for huge x, but inputs here are bounded
- * within [-2, 2] by SAT_PRE_T2_PREGAIN × (int16/32768) so it never matters.
- * Cost: 4 muls + 1 div + 2 adds ≈ 8 FPU cycles vs ~50 cycles for libm tanhf. */
-static inline float fast_tanh(float x)
-{
-    float x2 = x * x;
-    return x * (27.0f + x2) / (27.0f + 9.0f * x2);
-}
-
-/* pre_t2_sat on a float int16-scale value, returning the same scale, so the
- * T1 -> T2 bridge rounds once, after it. */
-static inline float pre_t2_sat_f(float x)
-{
-#ifdef DIAG_BISECT_NO_T2SAT
-    return x;
-#else
-    const float in_gain  = SAT_PRE_T2_PREGAIN * (1.0f / 32768.0f) * REVERB_OUT_MAKEUP;
-    const float out_gain = SAT_PRE_T2_POSTGAIN * 32768.0f * REVERB_HEADROOM;
-    return fast_tanh(x * in_gain) * out_gain;
-#endif
-}
-
-static inline int16_t pre_t2_sat(int16_t x)
-{
-#ifdef DIAG_BISECT_NO_T2SAT
-    /* Bisection: this shapes ring content that 32 T2 taps go on re-reading for
-     * the next 10.9 s, so a fault here would sound reverberant rather than like
-     * a bare click. */
-    return x;
-#else
-    const float scale_in  = 1.0f / 32768.0f;
-    const float scale_out = 32768.0f;
-    /* The /HEADROOM on in_gain and ×HEADROOM on out_gain cancel the internal
-     * headroom scaling for this stage only, so the tanh sees the same drive and
-     * the saturation character is unchanged while the ring stays cooled. */
-    const float in_gain  = SAT_PRE_T2_PREGAIN * scale_in * REVERB_OUT_MAKEUP;
-    const float out_gain = SAT_PRE_T2_POSTGAIN * scale_out * REVERB_HEADROOM;
-    float v = (float)x * in_gain;
-    return clamp_f_to_int16(fast_tanh(v) * out_gain);
-#endif
-}
+/* T1 -> T2 bridge gain. The DLD saturates here (a tanh, its character); on
+ * the Beads that put odd harmonics on everything, the 3rd only 38 dB down for a
+ * sine at -20 dBFS and 18 dB down at -6 dBFS, and the cascade's reverberation
+ * smeared them into a haze. The bridge is linear now, at the tanh's
+ * small-signal gain so levels and decay are as they were, with the soft knee
+ * after it for genuine overs. */
+#define T2_BRIDGE_GAIN  (1.1f * 1.05f)
 
 static void do_bridge_t1_to_t2(void)
 {
     /* T1's output at full scale 1.0 (crossfaded while its gains ramp), the
-     * cross-feed between the sides (STEREO_T2_XFEED), then the soft clip and
-     * pre-T2 saturation into the T2 rings. */
+     * cross-feed between the sides (STEREO_T2_XFEED), then the bridge gain and
+     * soft clip into the T2 rings. */
     float vl[REVERB_BLOCK], vr[REVERB_BLOCK];
     for (int i = 0; i < REVERB_BLOCK; i++) {
 #ifdef VELVET_REVERB_HOST
@@ -4353,13 +4310,13 @@ static void do_bridge_t1_to_t2(void)
     }
     t1_ramp_left = t1_ramp_left > REVERB_BLOCK ? t1_ramp_left - REVERB_BLOCK : 0;
     for (int i = 0; i < REVERB_BLOCK; i += 2) {
-        int16_t s0 = to_ring16(pre_t2_sat_f(soft_clip_unit(vl[i]) * 32767.0f));
-        int16_t s1 = to_ring16(pre_t2_sat_f(soft_clip_unit(vl[i + 1]) * 32767.0f));
+        int16_t s0 = to_ring16(soft_clip_unit(vl[i] * T2_BRIDGE_GAIN) * 32767.0f);
+        int16_t s1 = to_ring16(soft_clip_unit(vl[i + 1] * T2_BRIDGE_GAIN) * 32767.0f);
         uint32_t packed = ((uint32_t)(uint16_t)s1 << 16) | (uint32_t)(uint16_t)s0;
         uint32_t wi = block_write_idx + (uint32_t)i;
         *((volatile u32_alias *)&t2_ring[wi & T2_RING_MASK]) = packed;
-        int16_t r0 = to_ring16(pre_t2_sat_f(soft_clip_unit(vr[i]) * 32767.0f));
-        int16_t r1 = to_ring16(pre_t2_sat_f(soft_clip_unit(vr[i + 1]) * 32767.0f));
+        int16_t r0 = to_ring16(soft_clip_unit(vr[i] * T2_BRIDGE_GAIN) * 32767.0f);
+        int16_t r1 = to_ring16(soft_clip_unit(vr[i + 1] * T2_BRIDGE_GAIN) * 32767.0f);
         packed = ((uint32_t)(uint16_t)r1 << 16) | (uint32_t)(uint16_t)r0;
         *((volatile u32_alias *)&t2_ring_r[wi & T2_RING_MASK]) = packed;
     }
@@ -4545,8 +4502,17 @@ static void do_finalize(void)
     const float ceil_i16 = LIM_CEILING * 32768.0f;
     float target = 1.0f;
     if (pk > ceil_i16) target = ceil_i16 / pk;
-    if (target < lim_gain_target) lim_gain_target = target;
-    else lim_gain_target += LIM_RELEASE * (target - lim_gain_target);
+    /* Release only towards the lowest gain wanted over the last
+     * LIM_HOLD_BLOCKS (16 ms). A block is shorter than a bass note's cycle, so
+     * without the hold the gain dipped at each of the cycle's peaks and rose
+     * between them: a ripple at twice the note's pitch, which put its 3rd
+     * harmonic back on a low sine (-40 dB at 110 Hz with a hot input). */
+    lim_hold[lim_hold_idx] = target;
+    if (++lim_hold_idx >= LIM_HOLD_BLOCKS) lim_hold_idx = 0;
+    float held = target;
+    for (int i = 0; i < LIM_HOLD_BLOCKS; i++) if (lim_hold[i] < held) held = lim_hold[i];
+    if (held < lim_gain_target) lim_gain_target = held;
+    else lim_gain_target += LIM_RELEASE * (held - lim_gain_target);
 
     /* Pass 2: emit the PREVIOUS block, ramping the gain across it so it arrives
      * at the new target exactly as the block that demanded it begins. */
