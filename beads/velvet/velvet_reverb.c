@@ -746,18 +746,30 @@ void velvet_reverb_apply_tone_macro   (float v) { PROF_PANEL_IGNORED(); set_macr
 static float loop_thin_target = 0.0f, loop_thin_morph = 0.0f;   /* 0 = both lines, 1 = B only */
 
 /* ==== Input delay (the panel's pre-delay) ====
- * The input goes into a ring as it arrives and is read back a delay later, in
- * whole samples. A new delay never glides (that would re-pitch the input):
- * the read crossfades from the old delay to the new over ID_XFADE, once the
- * delay asked for is more than ID_STEP away, and a further change waits for
- * the fade to finish. */
+ * The input goes into a ring as it arrives and is read back a delay later.
+ * The delay asked for is smoothed (~20 ms), then followed two ways:
+ *   - small moves glide: the read moves at most ID_SLEW samples per sample
+ *     (1%, ~17 cents while it moves), reading between samples, so pot noise
+ *     and an attenurandomizer's drift pass without a trace;
+ *   - a jump of more than ID_JUMP (a knob turned) crossfades from the old
+ *     read to the new over ID_XFADE instead, as gliding that far would bend
+ *     the pitch for too long.
+ * It used to crossfade on every move of more than 1 ms. On the module, pot
+ * noise on TIME (or its attenurandomizer just off noon) moved the delay that
+ * much every second or so at mid settings, and each crossfade blended the
+ * input with itself a moment apart: heard in the echoes as repeated
+ * fragments. */
 #define ID_XFADE  (480 * REVERB_RATE_MULT)                 /* 20 ms */
-#define ID_STEP   (0.001f * (float)REVERB_FS_HZ)           /* 1 ms */
+#define ID_JUMP   (0.02f * (float)REVERB_FS_HZ)            /* 20 ms */
+#define ID_SLEW   0.01f
+#define ID_SMOOTH 0.002f                                   /* ~20 ms at 24 kHz */
 static int16_t * const input_delay = (int16_t *)INPUT_DELAY_BASE;
 static int16_t * const input_delay_r = (int16_t *)INPUT_DELAY_R_BASE;
 static uint32_t id_w;                       /* write index */
 static float id_target;                     /* delay asked for, samples */
-static int32_t id_cur, id_to, id_left;      /* delay read at, delay fading to, fade samples left */
+static float id_smooth;                     /* the same, smoothed */
+static float id_pos;                        /* delay read at, samples (fractional) */
+static int32_t id_to, id_left;              /* delay fading to, fade samples left */
 static float id_out[REVERB_BLOCK];          /* this block's delayed input, int16 scale */
 static float id_out_r[REVERB_BLOCK];
 
@@ -1995,7 +2007,8 @@ void velvet_reverb_init(void)
     input_ready_r = in_ring_r[0];
     for (uint32_t i = 0; i < INPUT_DELAY_SAMPLES; i++) input_delay[i] = input_delay_r[i] = 0;
     id_w = 0; id_left = 0;
-    id_cur = id_to = (int32_t)(id_target + 0.5f);
+    id_to = (int32_t)(id_target + 0.5f);
+    id_pos = id_smooth = (float)id_to;
     input_queue_max = 0;
     input_drop_count = 0;
     blocks_produced = 0;
@@ -3576,25 +3589,40 @@ static uint32_t prof_dma_checks, prof_dma_bad;
 static uint32_t prof_queue_max;          /* deepest backlog poll picked up since the last report */
 #endif
 
+/* One channel's input-delay read at a fractional delay d (>= 0) behind w. */
+static inline float id_read(const int16_t *ring, uint32_t w, float d)
+{
+    const int32_t i = (int32_t)d;
+    const float f = d - (float)i;
+    const float a = (float)ring[(w - (uint32_t)i) & INPUT_DELAY_MASK];
+    const float b = (float)ring[(w - (uint32_t)i - 1u) & INPUT_DELAY_MASK];
+    return a + f * (b - a);
+}
+
 static void do_input_delay(void)
 {
-    if (id_left == 0 && fabsf(id_target - (float)id_cur) > ID_STEP) {
-        id_to = (int32_t)(id_target + 0.5f);
-        id_left = ID_XFADE;
-    }
     for (int n = 0; n < REVERB_BLOCK; n++) {
         const uint32_t w = id_w++;
         input_delay[w & INPUT_DELAY_MASK] = input_ready[n];
         input_delay_r[w & INPUT_DELAY_MASK] = input_ready_r[n];
-        const uint32_t rc = (w - (uint32_t)id_cur) & INPUT_DELAY_MASK;
-        float x = (float)input_delay[rc], xr = (float)input_delay_r[rc];
+        id_smooth += ID_SMOOTH * (id_target - id_smooth);
+        if (id_left == 0) {
+            const float diff = id_smooth - id_pos;
+            if (diff > ID_JUMP || diff < -ID_JUMP) {
+                id_to = (int32_t)(id_smooth + 0.5f);
+                id_left = ID_XFADE;
+            } else {
+                id_pos += diff > ID_SLEW ? ID_SLEW : diff < -ID_SLEW ? -ID_SLEW : diff;
+            }
+        }
+        float x = id_read(input_delay, w, id_pos), xr = id_read(input_delay_r, w, id_pos);
         if (id_left > 0) {
             const uint32_t rt = (w - (uint32_t)id_to) & INPUT_DELAY_MASK;
             const float t = (float)(ID_XFADE - id_left) * (1.0f / (float)ID_XFADE);
             const float k = t * t * (3.0f - 2.0f * t);
             x  += k * ((float)input_delay[rt] - x);
             xr += k * ((float)input_delay_r[rt] - xr);
-            if (--id_left == 0) id_cur = id_to;
+            if (--id_left == 0) id_pos = (float)id_to;
         }
         id_out[n] = x;
         id_out_r[n] = xr;
