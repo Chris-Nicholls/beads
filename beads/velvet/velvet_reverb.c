@@ -2181,6 +2181,32 @@ static inline float soft_clip_knee(float x, float t)
 
 static inline float soft_clip_unit(float x) { return soft_clip_knee(x, SOFT_KNEE_T); }
 
+/* Rounding into the int16 rings. The cascade's rings are int16, and the
+ * conversions used to truncate toward zero: anything under one step vanished
+ * and quiet signals were crushed into steps, so a reverb tail decayed through
+ * an audible staircase into a gate (on the Beads, where the wet output is made
+ * up ×8, a 'decimated' grain under every tail). Each write into a ring now
+ * rounds with triangular dither of +-1 step, so a tail fades smoothly into a
+ * low, even hiss instead. */
+static uint32_t dither_state = 0x9E3779B9u;
+static inline float tpdf_dither(void)
+{
+    uint32_t x = dither_state;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    const uint32_t a = x;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    dither_state = x;
+    return (float)((int32_t)(a >> 9) + (int32_t)(x >> 9)) * (1.0f / 8388608.0f) - 1.0f;   /* -1..1 */
+}
+/* An int16-scale value into int16: dithered, rounded, clamped. */
+static inline int16_t to_ring16(float y)
+{
+    y += tpdf_dither();
+    int32_t i = (int32_t)(y + (y >= 0.0f ? 0.5f : -0.5f));
+    if (i > 32767) i = 32767; else if (i < -32768) i = -32768;
+    return (int16_t)i;
+}
+
 /* Q30 accumulator (Q15 sample × Q15 gain, summed) -> int16, soft-clipped at
  * full scale. 2^30 = full scale in the Q30 domain. Used at the stage bridges
  * and the output read. */
@@ -2193,7 +2219,7 @@ static inline int16_t soft_saturate_q15(int32_t x)
 static inline int16_t soft_saturate_q15_g(int32_t x, float g)
 {
     float v = (float)x * (g * (1.0f / 1073741824.0f));
-    return (int16_t)(soft_clip_unit(v) * 32767.0f);
+    return to_ring16(soft_clip_unit(v) * 32767.0f);
 }
 
 /* Hard int16 clamp — kept for coefficient clamping (effGains) and anywhere a
@@ -2209,7 +2235,7 @@ static inline int16_t clamp_f_to_int16(float v)
  * feedback writes, final output). Same knee as soft_saturate_q15. */
 static inline int16_t soft_clip_int16(float v)
 {
-    return (int16_t)(soft_clip_unit(v * (1.0f / 32768.0f)) * 32767.0f);
+    return to_ring16(soft_clip_unit(v * (1.0f / 32768.0f)) * 32767.0f);
 }
 
 /* ==== Output limiter ====
@@ -2264,7 +2290,8 @@ static inline int16_t soft_clip_int16(float v)
 
 static inline int16_t clip_out_int16(float v)
 {
-    return (int16_t)(soft_clip_knee(v * (1.0f / 32768.0f), SOFT_KNEE_OUT) * 32767.0f);
+    const float y = soft_clip_knee(v * (1.0f / 32768.0f), SOFT_KNEE_OUT) * 32767.0f;
+    return (int16_t)(y + (y >= 0.0f ? 0.5f : -0.5f));   /* rounded (the output is at full level) */
 }
 
 #ifdef VELVET_REVERB_HOST
@@ -4184,8 +4211,8 @@ static void do_bridge_t0_to_t1(void)
 #endif
         if (t0_ramp_left > 0) {
             const float f = ramp_frac(t0_ramp_left, i);
-            t1_ring[wi & T1_RING_MASK] = (int16_t)(soft_clip_unit(acc_blend(accT0_p[i], t0_makeup_prev, accT0[i], t0_makeup, f)) * 32767.0f);
-            t1_ring_r[wi & T1_RING_MASK] = (int16_t)(soft_clip_unit(acc_blend(accT0_r_p[i], t0_makeup_prev, accT0_r[i], t0_makeup, f)) * 32767.0f);
+            t1_ring[wi & T1_RING_MASK] = to_ring16(soft_clip_unit(acc_blend(accT0_p[i], t0_makeup_prev, accT0[i], t0_makeup, f)) * 32767.0f);
+            t1_ring_r[wi & T1_RING_MASK] = to_ring16(soft_clip_unit(acc_blend(accT0_r_p[i], t0_makeup_prev, accT0_r[i], t0_makeup, f)) * 32767.0f);
         } else {
             t1_ring[wi & T1_RING_MASK] = soft_saturate_q15_g(accT0[i], t0_makeup);
             t1_ring_r[wi & T1_RING_MASK] = soft_saturate_q15_g(accT0_r[i], t0_makeup);
@@ -4268,6 +4295,19 @@ static inline float fast_tanh(float x)
     return x * (27.0f + x2) / (27.0f + 9.0f * x2);
 }
 
+/* pre_t2_sat on a float int16-scale value, returning the same scale, so the
+ * T1 -> T2 bridge rounds once, after it. */
+static inline float pre_t2_sat_f(float x)
+{
+#ifdef DIAG_BISECT_NO_T2SAT
+    return x;
+#else
+    const float in_gain  = SAT_PRE_T2_PREGAIN * (1.0f / 32768.0f) * REVERB_OUT_MAKEUP;
+    const float out_gain = SAT_PRE_T2_POSTGAIN * 32768.0f * REVERB_HEADROOM;
+    return fast_tanh(x * in_gain) * out_gain;
+#endif
+}
+
 static inline int16_t pre_t2_sat(int16_t x)
 {
 #ifdef DIAG_BISECT_NO_T2SAT
@@ -4313,13 +4353,13 @@ static void do_bridge_t1_to_t2(void)
     }
     t1_ramp_left = t1_ramp_left > REVERB_BLOCK ? t1_ramp_left - REVERB_BLOCK : 0;
     for (int i = 0; i < REVERB_BLOCK; i += 2) {
-        int16_t s0 = pre_t2_sat((int16_t)(soft_clip_unit(vl[i]) * 32767.0f));
-        int16_t s1 = pre_t2_sat((int16_t)(soft_clip_unit(vl[i + 1]) * 32767.0f));
+        int16_t s0 = to_ring16(pre_t2_sat_f(soft_clip_unit(vl[i]) * 32767.0f));
+        int16_t s1 = to_ring16(pre_t2_sat_f(soft_clip_unit(vl[i + 1]) * 32767.0f));
         uint32_t packed = ((uint32_t)(uint16_t)s1 << 16) | (uint32_t)(uint16_t)s0;
         uint32_t wi = block_write_idx + (uint32_t)i;
         *((volatile u32_alias *)&t2_ring[wi & T2_RING_MASK]) = packed;
-        int16_t r0 = pre_t2_sat((int16_t)(soft_clip_unit(vr[i]) * 32767.0f));
-        int16_t r1 = pre_t2_sat((int16_t)(soft_clip_unit(vr[i + 1]) * 32767.0f));
+        int16_t r0 = to_ring16(pre_t2_sat_f(soft_clip_unit(vr[i]) * 32767.0f));
+        int16_t r1 = to_ring16(pre_t2_sat_f(soft_clip_unit(vr[i + 1]) * 32767.0f));
         packed = ((uint32_t)(uint16_t)r1 << 16) | (uint32_t)(uint16_t)r0;
         *((volatile u32_alias *)&t2_ring_r[wi & T2_RING_MASK]) = packed;
     }
@@ -4412,8 +4452,8 @@ static void do_finalize(void)
             rawL = soft_clip_unit(acc_blend(accL_p[i], t2_makeup_l_prev, accL[i], t2_makeup_l, f)) * (REVERB_OUT_MAKEUP * 32767.0f);
             rawR = soft_clip_unit(acc_blend(accR_p[i], t2_makeup_r_prev, accR[i], t2_makeup_r, f)) * (REVERB_OUT_MAKEUP * 32767.0f);
         } else {
-            rawL = (float)soft_saturate_q15_g(accL[i], t2_makeup_l) * REVERB_OUT_MAKEUP;
-            rawR = (float)soft_saturate_q15_g(accR[i], t2_makeup_r) * REVERB_OUT_MAKEUP;
+            rawL = soft_clip_unit((float)accL[i] * (t2_makeup_l * (1.0f / 1073741824.0f))) * (REVERB_OUT_MAKEUP * 32767.0f);
+            rawR = soft_clip_unit((float)accR[i] * (t2_makeup_r * (1.0f / 1073741824.0f))) * (REVERB_OUT_MAKEUP * 32767.0f);
         }
         float m = 0.5f * (rawL + rawR);
         float s = 0.5f * (rawL - rawR) * REVERB_STEREO_WIDTH;
@@ -4456,8 +4496,11 @@ static void do_finalize(void)
             rawL = soft_clip_unit(acc_blend(accL_p[i], t2_makeup_l_prev, accL[i], t2_makeup_l, f)) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
             rawR = soft_clip_unit(acc_blend(accR_p[i], t2_makeup_r_prev, accR[i], t2_makeup_r, f)) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
         } else {
-            rawL = (float)soft_saturate_q15_g(accL[i], t2_makeup_l) * (REVERB_OUT_MAKEUP / 32768.0f);
-            rawR = (float)soft_saturate_q15_g(accR[i], t2_makeup_r) * (REVERB_OUT_MAKEUP / 32768.0f);
+            /* In float, made up before the output is quantised: rounding it to
+             * int16 first and then making it up (x4, and the x2 wet gain after)
+             * left the output with ~13 bits. */
+            rawL = soft_clip_unit((float)accL[i] * (t2_makeup_l * (1.0f / 1073741824.0f))) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
+            rawR = soft_clip_unit((float)accR[i] * (t2_makeup_r * (1.0f / 1073741824.0f))) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
         }
         float m = 0.5f * (rawL + rawR);
         float s = 0.5f * (rawL - rawR) * REVERB_STEREO_WIDTH;
