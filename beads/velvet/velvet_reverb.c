@@ -450,8 +450,14 @@ void velvet_reverb_set_modulation(float amount)
  * 0.5, so the quietest tail loses ~1 bit of SNR. Raise toward 1.0 if the decay
  * sounds grainy; lower toward 0.5 if clipping persists. The pre-T2 saturator is
  * gain-compensated (see pre_t2_sat) so its drive/character is unchanged. */
+/* On the Beads the reverb takes the codec input raw, with no input gain
+ * control, so a held, bright modular signal at full send overran the stage
+ * bridges' soft knees (thousands of hits a second at 0.5 of full scale with
+ * the sustain loop full), heard as grit and pops that grew with Size. At
+ * 0.25 a full-scale sawtooth at full Size passes every stage below the knee;
+ * the output level is unchanged (the makeup follows). */
 #ifndef REVERB_HEADROOM                /* overridable so the harness can sweep it */
-#define REVERB_HEADROOM    0.5f
+#define REVERB_HEADROOM    0.25f
 #endif
 
 /* Soft-knee threshold (full-scale units) for the inter-stage / output saturators.
