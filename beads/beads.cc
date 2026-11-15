@@ -25,8 +25,8 @@
 //   DENSITY knob        Density macro (+ DENSITY CV): taps per reverb stage,
 //                       from a sparse few to the full set (the DLD's sound)
 //                       fully clockwise
-//   DRY/WET knob        Reverb send (equal power; the wet output is 2x the
-//                       DLD's, REVERB_OUT_GAIN). The top 10% fades the dry
+//   DRY/WET knob        Reverb send (equal power; the wet output is at the
+//                       DLD's level, REVERB_OUT_GAIN). The top 10% fades the dry
 //                       signal out, so the knob's end is 100% reverb.
 //   PITCH knob          Pitch shift of the reverb feed, on Beads' own detented
 //                       interval law (0, 1, 3, 4, 7, 12 semitones either way),
@@ -230,6 +230,24 @@ void SysTick_Handler() {
 
 }
 
+// The output's soft knee: unchanged up to kOutputKnee of full scale, then
+// bending smoothly towards full scale (slope 1 at the knee, so no corner).
+// The reverb limits its own output, but the dry signal is added after it, and
+// a hot input takes the sum over full scale; rounded off here, the overs are
+// a soft saturation rather than hard clips at the DAC, each one a click.
+const float kOutputKnee = 0.8f;
+
+static inline float OutputKnee(float x) {
+  const float a = fabsf(x);
+  if (a <= kOutputKnee) {
+    return x;
+  }
+  const float k = 1.0f - kOutputKnee;
+  const float e = a - kOutputKnee;
+  const float y = kOutputKnee + k * e / (k + e);
+  return x < 0.0f ? -y : y;
+}
+
 static inline int16_t SaturateInt16(float x) {
   x = std::max(std::min(x, 32767.0f), -32768.0f);
   return static_cast<int16_t>(x);
@@ -410,8 +428,8 @@ void Process(
     // input has already been copied to both).
     velvet_reverb_push_stereo(SaturateInt16(l * send * 32768.0f),
                               SaturateInt16(r * send * 32768.0f));
-    float out_l = l * dry + velvet_reverb_out_left() * (1.0f / 32768.0f);
-    float out_r = r * dry + velvet_reverb_out_right() * (1.0f / 32768.0f);
+    float out_l = OutputKnee(l * dry + velvet_reverb_out_left() * (1.0f / 32768.0f));
+    float out_r = OutputKnee(r * dry + velvet_reverb_out_right() * (1.0f / 32768.0f));
     CONSTRAIN(out_l, -1.0f, 0.999999f);
     CONSTRAIN(out_r, -1.0f, 0.999999f);
     out[i].l = static_cast<int32_t>(out_l * 2147483648.0f);

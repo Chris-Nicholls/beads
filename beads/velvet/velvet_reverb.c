@@ -2214,7 +2214,7 @@ static inline float soft_clip_unit(float x) { return soft_clip_knee(x, SOFT_KNEE
  * conversions used to truncate toward zero: anything under one step vanished
  * and quiet signals were crushed into steps, so a reverb tail decayed through
  * an audible staircase into a gate (on the Beads, where the wet output is made
- * up ×8, a 'decimated' grain under every tail). Each write into a ring now
+ * up ×4, a 'decimated' grain under every tail). Each write into a ring now
  * rounds with triangular dither of +-1 step, so a tail fades smoothly into a
  * low, even hiss instead. */
 static uint32_t dither_state = 0x9E3779B9u;
@@ -2297,10 +2297,11 @@ static inline int16_t soft_clip_int16(float v)
  * in place only to absorb the small overshoot a biquad step response can add on
  * top of the peak measured before it. */
 /* Wet output gain on the Beads, ahead of the limiter so loud tails are
- * limited rather than clipped: the DLD's level is about half of what the
- * Beads' DRY/WET knob should reach at the top. */
+ * limited rather than clipped. It was 2 (twice the DLD's level), but the dry
+ * signal is added to the wet after this and with a hot input the sum went
+ * over full scale; the DLD's own level leaves room for both. */
 #ifndef REVERB_OUT_GAIN
-#define REVERB_OUT_GAIN 2.0f
+#define REVERB_OUT_GAIN 1.0f
 #endif
 #define LIM_CEILING     0.95f    /* of full scale; peak is measured post-biquad  */
 #define SOFT_KNEE_OUT   0.97f    /* output-only knee; bridges keep SOFT_KNEE_T   */
@@ -4605,7 +4606,7 @@ static void do_finalize(void)
             rawR = soft_clip_unit(acc_blend(accR_p[i], t2_makeup_r_prev, accR[i], t2_makeup_r, f)) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
         } else {
             /* In float, made up before the output is quantised: rounding it to
-             * int16 first and then making it up (x4, and the x2 wet gain after)
+             * int16 first and then making it up (x4, then the wet gain)
              * left the output with ~13 bits. */
             rawL = soft_clip_unit((float)accL[i] * (t2_makeup_l * (1.0f / 1073741824.0f))) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
             rawR = soft_clip_unit((float)accR[i] * (t2_makeup_r * (1.0f / 1073741824.0f))) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
