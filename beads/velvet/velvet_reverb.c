@@ -100,6 +100,11 @@ __attribute__((always_inline)) static inline int32_t smlad(uint32_t a, uint32_t 
     return acc + (int32_t)(int16_t)(a & 0xFFFFu) * (int32_t)(int16_t)(b & 0xFFFFu)
                + (int32_t)(int16_t)(a >> 16)     * (int32_t)(int16_t)(b >> 16);
 }
+/* Dual 16-bit add, each half wrapping on its own. */
+__attribute__((always_inline)) static inline uint32_t sadd16(uint32_t a, uint32_t b)
+{
+    return ((a + b) & 0xFFFFu) | (((a >> 16) + (b >> 16)) << 16);
+}
 #else
 __attribute__((always_inline)) static inline int32_t qadd_sat(int32_t a, int32_t b)
 {
@@ -124,6 +129,13 @@ __attribute__((always_inline)) static inline int32_t smlad(uint32_t a, uint32_t 
 {
     int32_t r;
     __asm volatile ("smlad %0, %1, %2, %3" : "=r"(r) : "r"(a), "r"(b), "r"(acc));
+    return r;
+}
+/* Dual 16-bit add, each half wrapping on its own. */
+__attribute__((always_inline)) static inline uint32_t sadd16(uint32_t a, uint32_t b)
+{
+    uint32_t r;
+    __asm volatile ("sadd16 %0, %1, %2" : "=r"(r) : "r"(a), "r"(b));
     return r;
 }
 #endif
@@ -940,6 +952,9 @@ const float *host_dbg_predelay_out(void) { return predelay_out; }
  * LFO so the early cluster shimmers diffusely. cos/sin tables seeded at
  * regen; the shared phase advances per block. */
 static float t0_tap_mod_phase = 0.0f;
+/* The depth the previous block ended at (-1: none), so a change of depth
+ * also glides. */
+static float t0_mod_depth_last = -1.0f;
 static float t0TapModCos[MAX_T0_TAPS] CCM_ATTR;
 static float t0TapModSin[MAX_T0_TAPS] CCM_ATTR;
 
@@ -2083,6 +2098,7 @@ void velvet_reverb_init(void)
     pre_hp_coeff   = 1.0f - expf(-TWO_PI_F * PRE_HP_FREQ_HZ / (float)REVERB_FS_HZ);
     duck_atk_coeff = 1.0f - expf(-1.0f / (DUCK_ATK_SEC * (float)REVERB_FS_HZ));
     t0_tap_mod_phase = 0.0f;
+    t0_mod_depth_last = -1.0f;
 
     /* Morph state — initialise to targets so the first block produces a
      * meaningful output (avoids "fading up from zero" silence on boot). */
@@ -4097,91 +4113,149 @@ REVERB_CONV_FN static void do_t0_phase_fast(const int16_t *gains, int32_t *accl,
     }
 }
 
-/* Fractionally-delayed, gain-scaled accumulation of one tap into accT0 in a
- * single pass. The (REVERB_BLOCK+1)-sample window starting at `base` is read
- * once; for each output sample a packed pair {ring[base+k], ring[base+k+1]} is
- * combined with the packed gains `gab` = {ga, gb} via one SMLAD:
- *   accT0[k] += ring[base+k]·ga + ring[base+k+1]·gb
- * which is the 2-tap linear interpolation (ga = g·rf, gb = g·(1-rf)) folded
- * into the tap gain. Replaces the old two-pass scheme (2× ring reads + 2×
- * accT0 read-modify-write per tap). The internal SMLAD sum can't overflow:
- * |ring·ga + ring·gb| ≤ 32767·(ga+gb) = 32767·g ≤ 32767². */
-/* Per-tap read position and packed interpolation gains, computed once per block
- * by pass 1 of do_t0_phase_mod and consumed by its chunked pass 2. These exist
- * because the accumulator blocking puts the tap loop inside the chunk loop, and
- * the float work that derives them must not be repeated per chunk. */
-static uint32_t t0_mod_base[MAX_T0_TAPS] CCM_ATTR;
-static uint32_t t0_mod_gab [MAX_T0_TAPS] CCM_ATTR;
-
-/* Modulated T0 convolution — each tap's read position is displaced by a
- * per-tap (golden-angle phase) LFO so the early-reflection cluster shimmers
- * (Lexicon-style chorused early reflections). extra ∈ [0, 2·depth] keeps reads
- * in the past.
+/* Modulated T0: each tap's delay is pushed later by a per-tap LFO (one shared
+ * phase, rotated by the tap's golden-angle offset) so the early reflections
+ * shimmer, Lexicon-style. The extra delay d = depth * (1 + sin) is at least 0,
+ * so reads stay in the past.
  *
- * The modulation offset is held constant across the 16-sample block: a slow
- * chorus LFO moves < 1 sample over 0.67 ms, so a zero-order hold at block rate
- * (1500 Hz) is inaudible while letting us drop the per-sample float interp +
- * serial sin/cos recurrence (the old hot loop, ~657 µs) for the cheap Q15 SIMD
- * path. Each tap's fractional delay (idel + rf) is realised as a 2-tap linear
- * interpolation folded into the tap gain and applied in a single SMLAD pass
- * (see accumulate_t0_interp):
- *   accT0[n] += g·rf · ring[ri_base-1+n] + g·(1-rf) · ring[ri_base+n] */
-REVERB_CONV_FN static void t0_mod_pass2(const int16_t *ring, int32_t *acc, int n);
+ * The delay moves sample by sample: pass 1 works out each tap's linear-
+ * interpolation weights at the block's start and at its end (the next block's
+ * start), and pass 2 slides the weights between them across the block. It
+ * used to hold each tap's delay for the whole block and step it at the next,
+ * 1500 times a second, which put tones at multiples of 1500 Hz either side of
+ * everything played (a 440 Hz sine got 1060, 1940, 2560, 4060 Hz ... about
+ * 50 dB under it): heard as a sample-rate-reduction grit on sustained notes.
+ *
+ * A tap whose delay crosses a whole sample during the block reads three
+ * samples instead of two. Its weights at each end are the linear
+ * interpolation's (a triangle centred on the delay), so the read is exact at
+ * both ends and in between is a blend of the two, with no step anywhere.
+ *
+ * Weights are integers in the tap gain's scale. Most taps stay within one
+ * sample over a block; they read two samples, with both weights packed in one
+ * word and stepped by a packed change each sample, so a tap still costs one
+ * dual multiply-accumulate a sample (the change is rounded towards zero,
+ * which leaves the last sample up to 15 units of gain short of the next
+ * block's start). The few that cross a sample (one tap-block in twenty at the
+ * stock depth, one in five at full modulation) run a plain loop, their
+ * weights carried in Q4 so the end lands exactly. */
+#define T0_MOD_WIN  3
+static uint32_t t0_mod_base[MAX_T0_TAPS] CCM_ATTR;   /* oldest sample read, at the block's first sample */
+/* Two-sample taps, first in the list: {older, newer} weights at the block's
+ * start, their change a sample, and pass 2's running copy. */
+static uint32_t t0_mod_pw[MAX_T0_TAPS] CCM_ATTR;
+static uint32_t t0_mod_pd[MAX_T0_TAPS] CCM_ATTR;
+static uint32_t t0_mod_cur[MAX_T0_TAPS] CCM_ATTR;
+/* Three-sample taps, after them: weights at the start and change, Q4. */
+static int32_t  t0_mod_w0[MAX_T0_TAPS][T0_MOD_WIN] CCM_ATTR;
+static int32_t  t0_mod_dw[MAX_T0_TAPS][T0_MOD_WIN] CCM_ATTR;
 
-REVERB_CONV_FN static void do_t0_phase_mod(float depth, const int16_t *gains, int32_t *accl, int32_t *accr)
+/* The linear interpolation's weight for the sample j samples later than a
+ * read at extra delay d: a triangle, 1 at d = j. */
+static inline float t0_hat(float d, float j)
 {
-    int tapEnd = t0TapCount;
-    float ph0 = t0_tap_mod_phase;
-    float sinP0 = sinf(ph0), cosP0 = cosf(ph0);
-
-    /* Pass 1 — per-tap float work, once per block. Compacting the active taps
-     * into a dense list here (rather than testing g == 0 inside pass 2) keeps the
-     * inner loop branchless while preserving both the skip and the tap ordering,
-     * and the ordering is what makes the saturating accumulation bit-exact. */
-    int n = 0;
-    for (int t = 0; t < tapEnd; t++) {
-        int32_t g = (int32_t)gains[t];
-        if (g == 0) continue;
-        /* per-tap LFO sin (rotate base phase by the tap's golden-angle offset) */
-        float s = sinP0 * t0TapModCos[t] + cosP0 * t0TapModSin[t];
-        float delta = depth * (1.0f + s);          /* extra delay, always ≥ 0 */
-        int32_t idel = (int32_t)delta;              /* floor (delta ≥ 0) */
-        float   rf   = delta - (float)idel;         /* fractional part ∈ [0,1) */
-        int32_t ga   = (int32_t)((float)g * rf);    /* gain for older sample (ri_base-1) */
-        int32_t gb   = g - ga;                       /* gain for ri_base (conserves g) */
-        /* pack {ga (low half), gb (high half)} to pair with {ring[k], ring[k+1]} */
-        t0_mod_gab[n]  = ((uint32_t)(uint16_t)gb << 16) | ((uint32_t)(uint16_t)ga & 0xFFFFu);
-        t0_mod_base[n] = (block_write_idx - (uint32_t)effOffT0[t] - (uint32_t)idel - 1u) & T0_RING_MASK;
-        n++;
-    }
-
-    /* Pass 2 — chunked accumulation. Each SMLAD applies the 2-tap linear
-     * interpolation in one instruction: for output k it combines the packed pair
-     * {ring[base+k], ring[base+k+1]} with the packed gains {ga, gb}, i.e.
-     *   accT0[k] += ring[base+k]·ga + ring[base+k+1]·gb
-     * The internal sum cannot overflow: |ring·ga + ring·gb| <= 32767·(ga+gb)
-     * = 32767·g <= 32767². The guard region makes the (REVERB_BLOCK+1)-sample
-     * window contiguous for every base, so there is no wrap test and no gather. */
-    t0_mod_pass2(t0_ring, accl, n);
-    t0_mod_pass2(t0_ring_r, accr, n);
+    float x = d - j; if (x < 0.0f) x = -x;
+    return x < 1.0f ? 1.0f - x : 0.0f;
 }
 
-/* Pass 2 of do_t0_phase_mod for one channel's ring, from pass 1's taps. */
-REVERB_CONV_FN static void t0_mod_pass2(const int16_t *ring, int32_t *acc, int n)
+static inline uint32_t pack16(int32_t lo, int32_t hi)
 {
+    return ((uint32_t)(uint16_t)hi << 16) | (uint32_t)(uint16_t)lo;
+}
+
+REVERB_CONV_FN static void t0_mod_pass2(const int16_t *ring, int32_t *acc, int n2, int n);
+
+REVERB_CONV_FN static void do_t0_phase_mod(float depth0, float depth1, float inc,
+                                           const int16_t *gains, int32_t *accl, int32_t *accr)
+{
+    const int tapEnd = t0TapCount;
+    const float ph0 = t0_tap_mod_phase, ph1 = ph0 + (float)REVERB_BLOCK * inc;
+    const float sinP0 = sinf(ph0), cosP0 = cosf(ph0);
+    const float sinP1 = sinf(ph1), cosP1 = cosf(ph1);
+
+    /* Pass 1: per-tap float work, once per block: two-sample taps from the
+     * front of the list, three-sample taps from the back. */
+    int n2 = 0, n3 = MAX_T0_TAPS;
+    for (int t = 0; t < tapEnd; t++) {
+        const int32_t g = (int32_t)gains[t];
+        if (g == 0) continue;
+        const float d0 = depth0 * (1.0f + sinP0 * t0TapModCos[t] + cosP0 * t0TapModSin[t]);
+        const float d1 = depth1 * (1.0f + sinP1 * t0TapModCos[t] + cosP1 * t0TapModSin[t]);
+        const float dlo = d0 < d1 ? d0 : d1, dhi = d0 < d1 ? d1 : d0;
+        int32_t lo = (int32_t)dlo; if (lo < 0) lo = 0;     /* floor (d >= 0) */
+        /* A block moves the delay by well under a sample (at most ~0.15 at
+         * full depth), so it crosses at most one whole sample. */
+        const int win = ((int32_t)dhi > lo) ? 3 : 2;
+        const uint32_t base = (block_write_idx - (uint32_t)effOffT0[t] - (uint32_t)(lo + win - 1)) & T0_RING_MASK;
+        /* Window slot m holds the sample at extra delay lo + win-1-m: slot 0
+         * is the oldest. */
+        if (win == 2) {
+            const float j0 = (float)(lo + 1), j1 = (float)lo;
+            const int32_t a0 = (int32_t)((float)g * t0_hat(d0, j0)), a1 = (int32_t)((float)g * t0_hat(d1, j0));
+            const int32_t b0 = (int32_t)((float)g * t0_hat(d0, j1)), b1 = (int32_t)((float)g * t0_hat(d1, j1));
+            t0_mod_base[n2] = base;
+            t0_mod_pw[n2] = pack16(a0, b0);
+            t0_mod_pd[n2] = pack16((a1 - a0) / REVERB_BLOCK, (b1 - b0) / REVERB_BLOCK);
+            n2++;
+        } else {
+            --n3;
+            t0_mod_base[n3] = base;
+            for (int m = 0; m < T0_MOD_WIN; m++) {
+                const float j = (float)(lo + 2 - m);
+                const int32_t w0 = (int32_t)((float)g * t0_hat(d0, j) * 16.0f);
+                const int32_t w1 = (int32_t)((float)g * t0_hat(d1, j) * 16.0f);
+                t0_mod_w0[n3][m] = w0;
+                t0_mod_dw[n3][m] = (w1 - w0) / REVERB_BLOCK;
+            }
+        }
+    }
+
+    t0_mod_pass2(t0_ring, accl, n2, n3);
+    t0_mod_pass2(t0_ring_r, accr, n2, n3);
+}
+
+/* Pass 2 of do_t0_phase_mod for one channel's ring, from pass 1's taps:
+ * two-sample taps [0, n2), three-sample taps [n3, MAX_T0_TAPS). The ring's
+ * guard region covers REVERB_BLOCK + 1 samples past a window's start, enough
+ * for every two-sample window; a three-sample window starting in the ring's
+ * last sample needs one more, and is read through the mask. */
+REVERB_CONV_FN static void t0_mod_pass2(const int16_t *ring, int32_t *acc, int n2, int n3)
+{
+    for (int i = 0; i < n2; i++) t0_mod_cur[i] = t0_mod_pw[i];
     for (int c = 0; c < REVERB_BLOCK; c += REVERB_ACC_CHUNK) {
         int32_t a0 = acc[c], a1 = acc[c+1], a2 = acc[c+2], a3 = acc[c+3];
-
-        for (int i = 0; i < n; i++) {
-            const uint32_t gab = t0_mod_gab[i];
+        for (int i = 0; i < n2; i++) {
             const int16_t *src = &ring[t0_mod_base[i] + (uint32_t)c];
-            a0 = qadd_sat(a0, smlad(*((const u32_alias *)(src + 0)), gab, 0));
-            a1 = qadd_sat(a1, smlad(*((const u32_alias *)(src + 1)), gab, 0));
-            a2 = qadd_sat(a2, smlad(*((const u32_alias *)(src + 2)), gab, 0));
-            a3 = qadd_sat(a3, smlad(*((const u32_alias *)(src + 3)), gab, 0));
+            const uint32_t d = t0_mod_pd[i];
+            uint32_t w = t0_mod_cur[i];
+            a0 = qadd_sat(a0, smlad(*((const u32_alias *)(src + 0)), w, 0)); w = sadd16(w, d);
+            a1 = qadd_sat(a1, smlad(*((const u32_alias *)(src + 1)), w, 0)); w = sadd16(w, d);
+            a2 = qadd_sat(a2, smlad(*((const u32_alias *)(src + 2)), w, 0)); w = sadd16(w, d);
+            a3 = qadd_sat(a3, smlad(*((const u32_alias *)(src + 3)), w, 0)); w = sadd16(w, d);
+            t0_mod_cur[i] = w;
         }
-
         acc[c] = a0; acc[c+1] = a1; acc[c+2] = a2; acc[c+3] = a3;
+    }
+    for (int i = n3; i < MAX_T0_TAPS; i++) {
+        const uint32_t base = t0_mod_base[i];
+        int32_t wa = t0_mod_w0[i][0], wb = t0_mod_w0[i][1], wc = t0_mod_w0[i][2];
+        const int32_t da = t0_mod_dw[i][0], db = t0_mod_dw[i][1], dc = t0_mod_dw[i][2];
+        if (base + (uint32_t)REVERB_BLOCK + 1u < (uint32_t)(T0_RING_SAMPLES + REVERB_BLOCK)) {
+            const int16_t *src = &ring[base];
+            for (int k = 0; k < REVERB_BLOCK; k++) {
+                const int32_t y = (wa >> 4) * src[k] + (wb >> 4) * src[k + 1] + (wc >> 4) * src[k + 2];
+                acc[k] = qadd_sat(acc[k], y);
+                wa += da; wb += db; wc += dc;
+            }
+        } else {
+            for (int k = 0; k < REVERB_BLOCK; k++) {
+                const int32_t y = (wa >> 4) * ring[(base + (uint32_t)k) & T0_RING_MASK]
+                                + (wb >> 4) * ring[(base + (uint32_t)k + 1u) & T0_RING_MASK]
+                                + (wc >> 4) * ring[(base + (uint32_t)k + 2u) & T0_RING_MASK];
+                acc[k] = qadd_sat(acc[k], y);
+                wa += da; wb += db; wc += dc;
+            }
+        }
     }
 }
 
@@ -4196,12 +4270,15 @@ static void do_t0_phase(void)
     if (depth <= 0.0f) {
         do_t0_phase_fast(effGains_t0, accT0, accT0_r);
         if (t0_ramp_left > 0) do_t0_phase_fast(effGains_t0_prev, accT0_p, accT0_r_p);
+        t0_mod_depth_last = -1.0f;
         return;
     }
+    const float depth0 = t0_mod_depth_last >= 0.0f ? t0_mod_depth_last : depth;
     float rate = reverb_t0_tap_mod_rate; if (rate < 0.0f) rate = 0.0f;
     float inc = TWO_PI_F * rate / (float)REVERB_FS_HZ;
-    do_t0_phase_mod(depth, effGains_t0, accT0, accT0_r);
-    if (t0_ramp_left > 0) do_t0_phase_mod(depth, effGains_t0_prev, accT0_p, accT0_r_p);
+    do_t0_phase_mod(depth0, depth, inc, effGains_t0, accT0, accT0_r);
+    if (t0_ramp_left > 0) do_t0_phase_mod(depth0, depth, inc, effGains_t0_prev, accT0_p, accT0_r_p);
+    t0_mod_depth_last = depth;
     /* Advance the shared LFO phase by the block. */
     t0_tap_mod_phase += (float)REVERB_BLOCK * inc;
     t0_tap_mod_phase = fmodf(t0_tap_mod_phase, TWO_PI_F);
