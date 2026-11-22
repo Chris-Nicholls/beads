@@ -191,9 +191,8 @@ extern float beads_predelay_b_r_storage[PRE_DELAY_LINE_SAMPLES];
 #define T0_WINDOW_MAX_SAMPLES   (4800 * REVERB_RATE_MULT)     /* 200 ms */
 #define T1_WINDOW_MAX_SAMPLES   (16000 * REVERB_RATE_MULT)    /* ~666 ms */
 /* 5.33 s, as far as the T2 ring reaches less 3072 samples for the block
- * fetch: Size's midpoint is the DLD's 3.217 s, and its upper half stretches
- * T2 on to this (the decay lengthening through the loop as well). The 130
- * taps over it are ~24 a second, ~2.5x the DLD's. */
+ * fetch: the lower half of Size stretches T2 out to this. The 130 taps over
+ * it are ~24 a second, ~2.5x the DLD's. */
 #define T2_SPAN_MAX_S           5.3333333f
 #define T2_DURATION_MAX_SAMPLES (128000 * REVERB_RATE_MULT)   /* 5.33 s */
 
@@ -247,7 +246,7 @@ extern float reverb_dry_gain;
 extern float reverb_lpf_hz;
 extern float reverb_hpf_hz;
 
-/* Per-stage window/duration target (driven by the Decay macro) */
+/* Per-stage window/duration target (driven by the Size macro) */
 extern float reverb_t0_window_ms_target;     /* 0..~200 */
 extern float reverb_t1_window_ms_target;     /* 0..~666 */
 extern float reverb_t2_duration_s_target;    /* 0..~8 */
@@ -299,18 +298,15 @@ extern volatile uint8_t input_queue_max;
 
 /* ---- Macro system ----
  *
- * Four macros — Decay, Tone, Density and Size — each take a 0..1 pot position. Every
- * mapped param uses the full range: u lerps bound_min..bound_max (exp where both > 0).
- * Decay is the sustain loop's feedback; Size is the space: the T0/T1/T2 windows, which set the tap spacing
- * and the T1/T2 tap fades, with the DLD's at 0.6. (The Beads panel turns both with one knob,
- * as the DLD's Decay did.) */
-void velvet_reverb_apply_decay_macro  (float v);
+ * Three macros — Tone, Density and Size — each take a 0..1 pot position. */
 void velvet_reverb_apply_tone_macro   (float v);
 /* Density: taps per stage, from a sparse few (each heard as a grain or echo)
  * at 0 to the full set at 1, the default. Loudness is held as taps drop. */
 void velvet_reverb_apply_density_macro(float v);
-/* Size: from a small, tight space at 0 through the DLD's at 0.6 to the
- * longest windows at 1. */
+/* Size: the space and its decay. Its lower half lengthens the taps, from a
+ * small, tight space to the longest windows; its upper half raises the
+ * sustain loop's feedback, the taps' decay slowing with it so the loop's
+ * repeats stay hidden, up to full sustain at the top. */
 void velvet_reverb_apply_size_macro   (float v);
 /* The input delay, 0..1: 0 to INPUT_DELAY_MAX_S on a square law, so the
  * short times get most of the travel. */

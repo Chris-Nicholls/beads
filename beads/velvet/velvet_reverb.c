@@ -302,7 +302,7 @@ float reverb_send      = 0.7f;   /* updated each params iter from right MIX pot 
 float reverb_dry_gain  = 1.0f;   /* fades to 0 over top 10% of right MIX pot */
 /* Defaults below match the user's velvet_buffers slider snapshot. Macro-driven
  * params (windows, feedback, mix, lpf/hpf, high-shelf Hz) are recomputed from
- * the Decay/Tone pots at init. */
+ * the macros at init. */
 float reverb_lpf_hz    = 8600.0f;   /* Tone → MP_LPF */
 float reverb_hpf_hz    = 170.0f;    /* Tone → MP_HPF */
 
@@ -345,33 +345,11 @@ float reverb_t60_lo_ratio     = 0.49f;
 static float t60_hs_db, t60_ls_db;   /* the shelf gains they give, dB per trip */
 #endif
 
-/* ==== Loop decay curve ====
- *   REVERB_LOOP_FB_CURVE 1: while reverb_loop_curve_on, the sustain loop's
- *     feedback is capped so the loop's tail is short where DECAY first mixes
- *     it in, instead of a long quiet tail behind the cascade's ~1 s one. The
- *     cap gives line B (the longer line, which sets the tail) a T60 of
- *     reverb_loop_t60_lo seconds at DECAY reverb_loop_curve_lo and below,
- *     rising exponentially to meet the shipped feedback at
- *     reverb_loop_curve_join; from there up the feedback is the shipped one.
- *     The shelves add their own loss on top, so the tail is a little shorter
- *     than the cap's T60. The DECAY points are macro values (the pot scaled by
- *     1/DECAY_MACRO_TOP_SAT): the join, 0.75, is the pot at 0.72.
- *     On Beads, TIME is the loop's feedback alone, so the curve starts at the
- *     bottom of the knob: from a 0.25 s loop T60 at TIME 0 up to the join. */
-#ifndef REVERB_LOOP_FB_CURVE
-#define REVERB_LOOP_FB_CURVE 1
-#endif
-#if REVERB_LOOP_FB_CURVE
-int   reverb_loop_curve_on   = 1;
-float reverb_loop_t60_lo     = 0.25f;
-float reverb_loop_curve_lo   = 0.0f;
-float reverb_loop_curve_join = 0.75f;
-#endif
-
-/* T2's fade length (Size): T2's taps fall 80 dB over this length, and those
- * past it are silent, so at small sizes the tail fades before the window
- * ends. From Size's midpoint up it equals the T2 window. */
+/* T2's fade lengths (Size): the time T2's taps would take to fall 80 dB at
+ * their rate over the first SIZE_HIDE_S, and after it (those that reach
+ * -80 dB are silent). See SIZE_TAPS_U. */
 float reverb_t2_fade_s_target = 3.217f;
+float reverb_t2_fade_late_s_target = 3.217f;
 float reverb_t0_window_ms_target  = 69.0f;     /* driven by Size  */
 float reverb_t1_window_ms_target  = 536.0f;    /* driven by Size  */
 float reverb_t2_duration_s_target = 3.217f;    /* driven by Size  */
@@ -379,7 +357,7 @@ float reverb_t2_duration_s_target = 3.217f;    /* driven by Size  */
 /* ==== Pre-delay sustain engine params ==== Macro-driven: feedback, delay_mix,
  * high-shelf Hz. Fixed (no macro maps them): delay times, low-shelf, high-shelf
  * dB, fb-mod, duck. All values from the user's slider snapshot. */
-float reverb_feedback         = 0.969f;  /* driven by Decay */
+float reverb_feedback         = 0.969f;  /* driven by Size */
 /* The two loops' lengths are in the golden ratio, the most irrational of
  * ratios, so their echoes never fall back into step. (The DLD's 0.185 / 0.3 s
  * is 60/37, within 0.2% of it, but rational: the two lined up again every
@@ -564,11 +542,11 @@ uint32_t host_dbg_t2_gather_late  = 0;
 
 
 /* ==== Macro system ====
- * Four macros (Decay, Tone, Density, Size), each 0..1. Decay is the sustain
- * loop's feedback alone (with the loop curve below, from a 0.25 s loop T60). Size is the
- * space: the stage windows, which set both the tap spacing and the T1/T2 tap
- * fades, and the sustain loops' lengths. Every mapped param uses the full macro
- * range — macro value u lerps bound_min..bound_max (exp where both > 0). */
+ * Three macros (Tone, Density, Size), each 0..1. Every mapped param uses the
+ * full macro range: macro value u lerps bound_min..bound_max (exp where both
+ * > 0). Density and Size then reshape theirs (velvet_reverb_recompute_macros):
+ * Size sets the stage windows, which set both the tap spacing and the T1/T2
+ * tap fades, T2's fade and the sustain loop's feedback (see SIZE_TAPS_U). */
 /* Density: tap count per stage, from DENSITY_Tx_MIN to the full MAX_Tx_TAPS.
  * Turning down from the top, the stages thin one after another: T0 over the
  * top third of the knob, then T1 over the middle third, then T2 over the
@@ -579,10 +557,10 @@ uint32_t host_dbg_t2_gather_late  = 0;
  * path, and what is left is the sustain engine's loops (echoes, not a
  * wash). Counts are fractional: the tap at the boundary is part-faded. */
 /* The fewest taps Density keeps, as a share of each stage's whole span: the
- * DLD's one tap in its 40 at the midpoint window for T0 and T1, so the
- * sparse end keeps the DLD's taps per second too. T2's is a rate, 0.31 taps a
- * second over its whole span (about one tap in its window at Size's
- * midpoint), as it was when the span was 3.25 s with 80 taps; its dense end
+ * DLD's one tap in its 40 at the DLD's window (bound_mid) for T0 and T1, so
+ * the sparse end keeps the DLD's taps per second too. T2's is a rate, 0.31
+ * taps a second over its whole span (about one tap in the DLD's 3.2 s
+ * window), as it was when the span was 3.25 s with 80 taps; its dense end
  * is ~2.5x the DLD's. */
 #define DENSITY_T0_MIN  ((float)MAX_T0_TAPS / 40.0f)
 #define DENSITY_T1_MIN  ((float)MAX_T1_TAPS / 40.0f)
@@ -596,14 +574,12 @@ typedef enum {
     MP_T0_WINDOW,
     MP_T1_WINDOW,
     MP_T2_DURATION,
-    MP_FEEDBACK,
     MP_LPF,
     MP_HPF,
     MP_FB_HIGH_SHELF_HZ,
     MP_T0_COUNT,
     MP_T1_COUNT,
     MP_T2_COUNT,
-    MP_T2_FADE,
     MP_COUNT
 } macro_param_id_t;
 
@@ -612,7 +588,7 @@ typedef struct {
     float bound_min;
     float bound_max;
     uint8_t use_exp;       /* 1 = exp lerp when bounds both > 0; else linear */
-    float bound_mid;       /* > 0: exp through min, mid (at SIZE_MID_U) and max */
+    float bound_mid;       /* the windows: the DLD's, each stage's level reference */
 } macro_param_t;
 
 typedef struct {
@@ -621,13 +597,38 @@ typedef struct {
     const macro_param_id_t *params;
 } macro_t;
 
-/* Size's curves pass through the DLD's spacing (the defaults above, and loop
- * scale 1) at SIZE_MID_U, a little past noon, so the default sound is the
- * DLD's and the knob reaches far either side of it: down to a small, tight
- * space (short loops, short T2 fade; the windows only go down to their old
- * minimums, see reverb_t2_fade_s_target), up to the longest windows the
- * rings hold. */
-#define SIZE_MID_U  0.6f
+#define T2_LONG_FADE_COMP   0.5f
+
+/* Size sets the space and its decay in two halves (velvet_reverb_recompute_
+ * macros): up to SIZE_TAPS_U the taps lengthen, every stage's window from its
+ * minimum to its maximum below; from there the windows stay at their longest
+ * and the sustain loop's feedback rises, its decay time (T60) reaching
+ * SIZE_LOOP_T60_MAX at SIZE_LOOP_TOP of that half, with full sustain above.
+ *
+ * The loop is kept hidden behind the taps. A loop repeating every t seconds
+ * with gain f is heard as repeats unless some tap later than t is louder
+ * than f; then each repeat arrives under the taps of the one before it. Each
+ * loop's gain is set for one decay rate per second (see LOOP_T60_REF_S), so
+ * that holds for both loops while T2's taps decay more slowly than the loop
+ * over the longer loop's period, and SIZE_TAPS_SLOWER times as slowly gives
+ * a margin. They do so over the first SIZE_HIDE_S, and after it fall
+ * SIZE_LATE_FASTER times as fast as the loop, so the tail decays at about
+ * one rate and the end of T2's window is lost under the repeats (taps that
+ * kept the slow rate to the end would stop there, well above the loop's
+ * tail, which the loop's shelves leave weaker than the first pass). While the
+ * taps lengthen the loop decays at their window's rate (80 dB over it); once
+ * they are at their longest it slows and T2's fades follow it. At full
+ * sustain the taps are held all but level (SIZE_FADE_HELD). */
+#define SIZE_TAPS_U         0.5f
+#define SIZE_HIDE_S         0.6f     /* s: twice the longer loop */
+#define SIZE_LATE_FASTER    1.5f
+#define SIZE_LOOP_T60_MAX   60.0f    /* s */
+#define SIZE_LOOP_TOP       0.96f    /* of the loop's half: full sustain above */
+#define SIZE_TAPS_SLOWER    2.0f
+#define SIZE_FADE_HELD      1000.0f  /* s: T2's taps all but level */
+#ifndef LOOP_T60_REF_S
+#define LOOP_T60_REF_S      0.27f    /* see LOOP_BLUR */
+#endif
 
 /* Unmapped globals (predelay times, shelf dB/freq-low, duck, fb-mod) keep their
  * fixed defaults. */
@@ -635,8 +636,6 @@ static macro_param_t reverb_macro_params[MP_COUNT] = {
     [MP_T0_WINDOW]        = { &reverb_t0_window_ms_target,   37.0f,   200.0f,  1,  69.0f  },
     [MP_T1_WINDOW]        = { &reverb_t1_window_ms_target,  230.0f,   660.0f,  1, 536.0f  },
     [MP_T2_DURATION]      = { &reverb_t2_duration_s_target,   1.6f, T2_SPAN_MAX_S, 1, 3.217f },
-    [MP_T2_FADE]          = { &reverb_t2_fade_s_target,       0.9f, T2_SPAN_MAX_S, 1, 3.217f },
-    [MP_FEEDBACK]         = { &reverb_feedback,               0.8f,     1.0f,  1 },
     [MP_LPF]              = { &reverb_lpf_hz,               500.0f, 20000.0f,  1 },
     [MP_HPF]              = { &reverb_hpf_hz,               100.0f,   200.0f,  1 },
     [MP_FB_HIGH_SHELF_HZ] = { &reverb_fb_high_shelf_hz,    1000.0f,  2500.0f,  1 },
@@ -645,11 +644,8 @@ static macro_param_t reverb_macro_params[MP_COUNT] = {
     [MP_T2_COUNT]         = { &reverb_t2_count_target, DENSITY_T2_MIN, (float)MAX_T2_TAPS, 1 },
 };
 
-static const macro_param_id_t decay_params[] = {
-    MP_FEEDBACK,
-};
 static const macro_param_id_t size_params[] = {
-    MP_T2_DURATION, MP_T0_WINDOW, MP_T1_WINDOW, MP_T2_FADE,
+    MP_T2_DURATION, MP_T0_WINDOW, MP_T1_WINDOW,
 };
 static const macro_param_id_t tone_params[] = {
     MP_LPF, MP_HPF, MP_FB_HIGH_SHELF_HZ,
@@ -659,16 +655,14 @@ static const macro_param_id_t density_params[] = {
 };
 
 #define M_COUNT(arr) (int)(sizeof(arr) / sizeof((arr)[0]))
-#define MACRO_DECAY  0
-#define MACRO_TONE   1
-#define MACRO_DENSITY 2
-#define MACRO_SIZE   3
-#define NUM_MACROS   4
+#define MACRO_TONE   0
+#define MACRO_DENSITY 1
+#define MACRO_SIZE   2
+#define NUM_MACROS   3
 static macro_t reverb_macros[NUM_MACROS] = {
-    { 0.86f, M_COUNT(decay_params),   decay_params   },
     { 0.77f, M_COUNT(tone_params),    tone_params    },
     { 1.00f, M_COUNT(density_params), density_params },   /* full density: the DLD's sound */
-    { SIZE_MID_U, M_COUNT(size_params), size_params  },   /* the DLD's spacing */
+    { SIZE_TAPS_U, M_COUNT(size_params), size_params },
 };
 
 /* Macro recompute is ~14 powf calls (~17 µs). Called from params.c at
@@ -688,11 +682,7 @@ void velvet_reverb_recompute_macros(void)
         for (int i = 0; i < n; i++) {
             const macro_param_t *mp = &reverb_macro_params[pids[i]];
             float val;
-            if (mp->bound_mid > 0.0f) {
-                val = (u < SIZE_MID_U)
-                    ? mp->bound_min * powf(mp->bound_mid / mp->bound_min, u * (1.0f / SIZE_MID_U))
-                    : mp->bound_mid * powf(mp->bound_max / mp->bound_mid, (u - SIZE_MID_U) * (1.0f / (1.0f - SIZE_MID_U)));
-            } else if (mp->use_exp && mp->bound_min > 0.0f && mp->bound_max > 0.0f &&
+            if (mp->use_exp && mp->bound_min > 0.0f && mp->bound_max > 0.0f &&
                 mp->bound_min != mp->bound_max) {
                 val = mp->bound_min * powf(mp->bound_max / mp->bound_min, u);
             } else {
@@ -714,22 +704,36 @@ void velvet_reverb_recompute_macros(void)
             *mp->target = mp->bound_min * powf(mp->bound_max / mp->bound_min, x);
         }
     }
-#if REVERB_LOOP_FB_CURVE
-    float d = reverb_macros[MACRO_DECAY].value;
-    if (reverb_loop_curve_on && d < reverb_loop_curve_join) {
-        const macro_param_t *fp = &reverb_macro_params[MP_FEEDBACK];
-        float lo = reverb_loop_curve_lo, join = reverb_loop_curve_join;
-        if (join > 0.98f) join = 0.98f;        /* feedback reaches 1.0 at the top */
-        if (lo > join - 0.01f) lo = join - 0.01f;
-        /* line B's T60 under the shipped feedback at the join, in seconds */
-        float fb_join = fp->bound_min * powf(fp->bound_max / fp->bound_min, join);
-        float t60_join = -3.0f * reverb_predelay_b_s / log10f(fb_join);
-        float x = (d - lo) / (join - lo); if (x < 0.0f) x = 0.0f;
-        float t60 = reverb_loop_t60_lo * powf(t60_join / reverb_loop_t60_lo, x);
-        float fb_cap = powf(10.0f, -3.0f * reverb_predelay_b_s / t60);
-        if (fb_cap < reverb_feedback) reverb_feedback = fb_cap;
+    /* Size: first the taps, then the loop. */
+    {
+        float u = reverb_macros[MACRO_SIZE].value;
+        if (u < 0.0f) u = 0.0f; if (u > 1.0f) u = 1.0f;
+        float x = u * (1.0f / SIZE_TAPS_U);
+        if (x > 1.0f) x = 1.0f;
+        static const macro_param_id_t ids[3] = { MP_T0_WINDOW, MP_T1_WINDOW, MP_T2_DURATION };
+        for (int k = 0; k < 3; k++) {
+            const macro_param_t *mp = &reverb_macro_params[ids[k]];
+            *mp->target = mp->bound_min * powf(mp->bound_max / mp->bound_min, x);
+        }
+        /* T2's taps fall 80 dB over the window, so their T60 is 3/4 of it:
+         * the loop's while the taps lengthen. */
+        const float win = reverb_t2_duration_s_target;
+        const float t60_join = 0.75f * T2_SPAN_MAX_S;
+        float y = (u - SIZE_TAPS_U) * (1.0f / (1.0f - SIZE_TAPS_U));
+        if (y >= SIZE_LOOP_TOP) {
+            reverb_feedback = 1.0f;
+            reverb_t2_fade_s_target = reverb_t2_fade_late_s_target = SIZE_FADE_HELD;
+        } else {
+            const float t60 = (y <= 0.0f)
+                ? 0.75f * win
+                : t60_join * powf(SIZE_LOOP_T60_MAX / t60_join, y * (1.0f / SIZE_LOOP_TOP));
+            reverb_feedback = powf(10.0f, -3.0f * LOOP_T60_REF_S / t60);
+            /* 80 dB at the slower rate that hides the loop, then a little faster than the loop */
+            const float loop = (4.0f / 3.0f) * t60;
+            reverb_t2_fade_s_target = loop * SIZE_TAPS_SLOWER;
+            reverb_t2_fade_late_s_target = loop * (1.0f / SIZE_LATE_FASTER);
+        }
     }
-#endif
 #if REVERB_LOOP_T60_SHELVES
     /* After the feedback is final: do_predelay clamps it to 0.999 the same way. */
     float fb = reverb_feedback;
@@ -765,19 +769,6 @@ static inline void set_macro_value(int idx, float v) {
     macros_dirty = 1;
 }
 
-/* The Decay→feedback curve (bounds {0.8, 1.0}, exp) is extremely sensitive at
- * the top: the last few % of travel cover fb 0.994→0.999, which is roughly a
- * 6x tail-length change and a ~9 dB drop in the sustain plateau. Hardware pots
- * rarely reach full ADC scale, so the pre-delay tail would never reach the
- * full length the design allows at macro = 100. Saturate the top of the Decay
- * macro so the last DECAY_MACRO_TOP_SAT of travel maps to full — this leaves the
- * true-full behaviour unchanged, it only makes it reachable. */
-#define DECAY_MACRO_TOP_SAT  0.96f
-void velvet_reverb_apply_decay_macro  (float v) {
-    PROF_PANEL_IGNORED();
-    v *= (1.0f / DECAY_MACRO_TOP_SAT);          /* set_macro_value clamps to [0,1] */
-    set_macro_value(MACRO_DECAY, v);
-}
 void velvet_reverb_apply_tone_macro   (float v) { PROF_PANEL_IGNORED(); set_macro_value(MACRO_TONE, v); }
 /* Below one tap a stage, Density thins the sustain loop's echoes: over the
  * bottom DENSITY_THIN_U of its travel, line A (the shorter) fades out of the
@@ -854,6 +845,7 @@ static float t0_window_morph;       /* samples at fs_reverb */
 static float t1_window_morph;
 static float t2_window_morph;
 static float t2_fade_morph;         /* samples (Size) */
+static float t2_fade_late_morph;    /* samples (Size) */
 static float t0_tap_comp_morph;
 static float t1_tap_comp_morph;
 static float t2_tap_comp_morph;
@@ -2076,8 +2068,7 @@ void velvet_reverb_init(void)
 {
     /* Apply default macro positions so the reverb_* targets reflect the
      * macro-derived values rather than the raw initialisers at the top of
-     * this file. Density and Decay start at 0; Tone at 0.83, the position the
-     * macro bounds were captured at. */
+     * this file. */
     velvet_reverb_recompute_macros();
 
     {
@@ -2209,6 +2200,7 @@ void velvet_reverb_init(void)
     t1_window_morph = reverb_t1_window_ms_target * (float)REVERB_FS_HZ / 1000.0f;
     t2_window_morph = reverb_t2_duration_s_target * (float)REVERB_FS_HZ;
     t2_fade_morph = reverb_t2_fade_s_target * (float)REVERB_FS_HZ;
+    t2_fade_late_morph = reverb_t2_fade_late_s_target * (float)REVERB_FS_HZ;
     t0_tap_comp_morph = 1.0f;
     t1_tap_comp_morph = 1.0f;
     t2_tap_comp_morph = 1.0f;
@@ -2764,9 +2756,11 @@ static void recompute_eff_gains_t2(void)
     float fade = window * FADE_WINDOW_FRAC;
     if (fade < T2_FADE_MIN) fade = T2_FADE_MIN;
     float invWindow = (window > 1e-6f) ? 1.0f / window : 0.0f;
-    /* The taps fall 80 dB over the fade length, which is the window from
-     * Size's midpoint up and shorter than it below. */
+    /* The taps fall 80 dB over the fade length, slowly for SIZE_HIDE_S and
+     * then at the late rate (see SIZE_TAPS_U). */
     const float invFade = (t2_fade_morph > 1e-6f) ? 1.0f / t2_fade_morph : 0.0f;
+    const float invFadeLate = (t2_fade_late_morph > 1e-6f) ? 1.0f / t2_fade_late_morph : 0.0f;
+    const float knee = SIZE_HIDE_S * (float)REVERB_FS_HZ;
 
     float effWin[MAX_T2_TAPS];
     compute_tap_states_lr(t2TapLadderL, t2TapLadderR, t2TapLadderCount, count,
@@ -2775,14 +2769,17 @@ static void recompute_eff_gains_t2(void)
     /* refEnergy is the stage's energy with the fade spanning the window: the
      * level compensation works from it, and the taps are scaled to keep it, so
      * a fade shorter than the window shortens the tail without making it
-     * quieter. When the two are equal, so are the energies. */
+     * quieter. A fade longer than the window (Size's top half) adds energy,
+     * of which T2_LONG_FADE_COMP (in dB) is taken back: kept, the tail would
+     * swell sustained sounds; all taken, it would soften every onset. */
     float pre[MAX_T2_TAPS];
     float energy = 0.0f, thinEnergy = 0.0f, refEnergy = 0.0f;
     for (int t = 0; t < count; t++) {
         const float off = (float)effOffT2L[t];
         const float base = (float)t2TapGains[t] * effWin[t];
         const float r = base * exp_decay_from_frac(off * invWindow);
-        float g = base * exp_decay_from_frac(off * invFade);
+        float g = base * exp_decay_from_frac(off < knee ? off * invFade
+                                             : knee * invFade + (off - knee) * invFadeLate);
         refEnergy += r * r;
         energy += g * g;
         pre[t] = g;
@@ -2798,7 +2795,11 @@ static void recompute_eff_gains_t2(void)
     thinEnergy = density_apply(pre, effOffT2L, t2TapRanks, t2TapOrder, count, t2_count_morph, &t2_wander);
     const float thinEnergyR = density_apply(preR, effOffT2R, t2TapRanks, t2TapOrder, count, t2_count_morph, &t2_wander_r);
     float densComp = density_comp(energy, thinEnergy), densCompR = density_comp(energy, thinEnergyR);
-    if (refEnergy != energy && energy > 1e-6f) { const float k = sqrtf(refEnergy / energy); densComp *= k; densCompR *= k; }
+    if (refEnergy != energy && energy > 1e-6f) {
+        const float k = (refEnergy > energy) ? sqrtf(refEnergy / energy)
+                                             : powf(refEnergy / energy, 0.5f * T2_LONG_FADE_COMP);
+        densComp *= k; densCompR *= k;
+    }
     for (int t = 0; t < count; t++) { pre[t] *= densComp; preR[t] *= densCompR; }
 
     float comp = 1.0f;
@@ -2866,6 +2867,7 @@ static void update_morph_state(void)
     t1_window_morph += ALPHA_WINDOW_MORPH * (t1_win_target - t1_window_morph);
     t2_window_morph += ALPHA_WINDOW_MORPH * (t2_win_target - t2_window_morph);
     t2_fade_morph += ALPHA_WINDOW_MORPH * (reverb_t2_fade_s_target * (float)REVERB_FS_HZ - t2_fade_morph);
+    t2_fade_late_morph += ALPHA_WINDOW_MORPH * (reverb_t2_fade_late_s_target * (float)REVERB_FS_HZ - t2_fade_late_morph);
 
     /* The loop lengths. They are not glided: a moving delay in the feedback
      * loop re-pitches the whole tail. do_predelay steps to them (see PdLen).
@@ -2921,7 +2923,7 @@ static void update_morph_state(void)
 #define DB_DURATION_SAMPLES (DB_DURATION_TARGET * (float)REVERB_FS_HZ)            /* 240 */
 
 static float last_t0_win_target = -1e9f, last_t1_win_target = -1e9f, last_t2_dur_target = -1e9f;
-static float last_t2_fade_target = -1e9f;
+static float last_t2_fade_target = -1e9f, last_t2_fade_late_target = -1e9f;
 static float last_t0_cnt_target = -1e9f, last_t1_cnt_target = -1e9f, last_t2_cnt_target = -1e9f;
 static uint16_t effgains_settle_counter = 0;
 static uint16_t effgains_periodic_counter = 0;
@@ -2954,6 +2956,9 @@ static void background_eff_gains_update(void)
     }
     if (fabsf(reverb_t2_fade_s_target - last_t2_fade_target) > DB_DURATION_TARGET) {
         last_t2_fade_target = reverb_t2_fade_s_target; changed = 1;
+    }
+    if (fabsf(reverb_t2_fade_late_s_target - last_t2_fade_late_target) > DB_DURATION_TARGET) {
+        last_t2_fade_late_target = reverb_t2_fade_late_s_target; changed = 1;
     }
 
     /* Size moves each stage's energy a long way, so the level comps must
@@ -3008,6 +3013,7 @@ static void background_eff_gains_update(void)
                 fabsf(t1w - t1_window_morph) < DB_WINDOW_SAMPLES &&
                 fabsf(t2w - t2_window_morph) < DB_DURATION_SAMPLES &&
                 fabsf(reverb_t2_fade_s_target * (float)REVERB_FS_HZ - t2_fade_morph) < DB_DURATION_SAMPLES &&
+                fabsf(reverb_t2_fade_late_s_target * (float)REVERB_FS_HZ - t2_fade_late_morph) < DB_DURATION_SAMPLES &&
                 fabsf(reverb_t0_count_target - t0_count_morph) < DB_COUNT_TARGET &&
                 fabsf(reverb_t1_count_target - t1_count_morph) < DB_COUNT_TARGET &&
                 fabsf(reverb_t2_count_target - t2_count_morph) < DB_COUNT_TARGET;
@@ -3482,10 +3488,6 @@ static void pd_init(void)
 #ifndef LOOP_DRIFT
 #define LOOP_DRIFT   0.35f
 #endif
-#ifndef LOOP_T60_REF_S
-#define LOOP_T60_REF_S   0.27f
-#endif
-
 /* One line's read for a whole block: modulated fractional read (and the
  * crossfade when its length steps). The read state is worked on in a local
  * copy so it can stay in registers. */
@@ -4980,7 +4982,7 @@ static void prof_report_live(void)
     }
 #ifdef DIAG_PROFILE_LIVE
     static uint32_t last_decay = 0xFFFFu, last_tone = 0xFFFFu, last_oct = 0xFFFFu;
-    const uint32_t decay = (uint32_t)(reverb_macros[MACRO_DECAY].value * 4095.0f);
+    const uint32_t decay = (uint32_t)(reverb_macros[MACRO_SIZE].value * 4095.0f);
     const uint32_t tone  = (uint32_t)(reverb_macros[MACRO_TONE].value * 4095.0f);
     const uint32_t oct   = (pitch_mix_target == 0.0f) ? 1u : (pitch_semis_target > 0.0f ? 2u : 0u);
     if (decay != last_decay) diag_log(DIAG_EVT_REVERB_DROP, DIAG_LIVE(DIAG_LIVE_DECAY, decay));
@@ -5037,13 +5039,12 @@ static void prof_step(void)
     }
 
 #ifndef DIAG_PROFILE_LIVE
-    /* Decay 0.05..1 every 9 s (the full range: short decays included), Tone
+    /* Size 0.05..1 every 9 s (the full range: short decays included), Tone
      * 0.3..1 every 6.3 s. */
     float pd = (float)(b % (PROF_BLOCKS_PER_S * 9u)) / (float)(PROF_BLOCKS_PER_S * 9u);
     float pt = (float)(b % (PROF_BLOCKS_PER_S * 63u / 10u)) / (float)(PROF_BLOCKS_PER_S * 63u / 10u);
     float td = (pd < 0.5f) ? 2.0f * pd : 2.0f - 2.0f * pd;
     float tt = (pt < 0.5f) ? 2.0f * pt : 2.0f - 2.0f * pt;
-    set_macro_value(MACRO_DECAY, 0.05f + 0.95f * td);
     set_macro_value(MACRO_SIZE,  0.05f + 0.95f * td);
     set_macro_value(MACRO_TONE,  0.30f + 0.70f * tt);
 #endif

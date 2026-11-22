@@ -10,10 +10,10 @@
 //   TIME knob           Pre-delay: the whole reverb comes in up to 0.68 s after
 //                       the dry signal (square law, short times get the
 //                       travel)
-//   SIZE knob           The space and its decay together, as the DLD's Decay
-//                       knob: how long the reverb's taps are spread over, how
-//                       long they take to fade, and the sustain loop's
-//                       feedback; the DLD's default a little past noon
+//   SIZE knob           The space and its decay together: up to noon the
+//                       reverb's taps spread longer, past noon the sustain
+//                       loop's feedback rises (its repeats kept under the
+//                       taps), to full sustain at the top
 //   SHAPE knob          Tone macro
 //   TIME, SIZE, SHAPE and PITCH each have an attenuverter and a CV input, which
 //   work as on Beads (RandomizedParameter): with the CV jack patched, clockwise
@@ -142,11 +142,7 @@ volatile bool ready = false;
 
 // Written by the audio callback, read by the main loop.
 volatile float predelay_target = 0.0f;
-volatile float size_target = 0.305f;   // the DLD's default, through kSizeLaw
-// SIZE's knob law: the macro is the knob position (with its CV) to this
-// power, so the top end gets more of the travel: what was noon now sits at
-// 9 o'clock (0.2^kSizeLaw = 0.5), and the DLD's default (macro 0.6) at 0.3.
-const float kSizeLaw = 0.4307f;
+volatile float size_target = 0.5f;
 volatile float tone_target = 0.5f;
 volatile float density_target = 1.0f;
 volatile float pitch_target = 0.0f;
@@ -537,9 +533,7 @@ int main(void) {
   while (1) {
     // The macro setters only store a target (with a dead-band); the reverb
     // picks the change up inside poll, so calling them every pass is cheap.
-    const float size_macro = powf(size_target, kSizeLaw);
-    velvet_reverb_apply_decay_macro(size_macro);
-    velvet_reverb_apply_size_macro(size_macro);
+    velvet_reverb_apply_size_macro(size_target);
     velvet_reverb_set_input_delay(predelay_target);
     velvet_reverb_apply_tone_macro(tone_target);
     velvet_reverb_apply_density_macro(density_target);
