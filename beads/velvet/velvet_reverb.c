@@ -768,8 +768,9 @@ void velvet_reverb_apply_tone_macro   (float v) { PROF_PANEL_IGNORED(); set_macr
 /* Below one tap a stage, Density thins the sustain loop's echoes: over the
  * bottom DENSITY_THIN_U of its travel, line A (the shorter) fades out of the
  * cascade feed and line B takes its level, so two interleaved echo trains
- * become one. Line A keeps recirculating, so turning back up brings its tail
- * straight back. */
+ * become one, and the loops' blur turns down to none, so that train repeats
+ * only itself instead of multiplying. Line A keeps recirculating, so turning
+ * back up brings its tail straight back. */
 #define DENSITY_THIN_U  0.25f
 static float loop_thin_target = 0.0f, loop_thin_morph = 0.0f;   /* 0 = both lines, 1 = B only */
 
@@ -3379,9 +3380,10 @@ static void pd_init(void)
 }
 
 /* The two loops on each side, after the Cosmos engine's family A: each
- * loop's feedback reads a share of the other loop (LOOP_BLUR), so an echo of
- * one comes round again at the other's length, and on, and the repeats
- * multiply. And the two loops' shares of the feed drift on slow random-walk
+ * loop's feedback reads a share of the other loop (LOOP_BLUR, less over the
+ * bottom of Density: see DENSITY_THIN_U), so an echo of one comes round again
+ * at the other's length, and on, and the repeats multiply. And the two loops'
+ * shares of the feed drift on slow random-walk
  * LFOs (LOOP_DRIFT), differently on each side.
  *
  * Cosmos's blend (own 1 - 0.49 blur, other 0.51 blur) keeps the level of
@@ -3436,12 +3438,12 @@ void pd_line_read(float *phase, PdReadState *rd, const float *line, float wbase,
 }
 
 /* One line's node for a whole block from its own read and the other loop's
- * (the blur): shelves, DC block, feedback, input. */
+ * (the blur, 0..LOOP_BLUR): shelves, DC block, feedback, input. */
 __attribute__((always_inline)) static inline
 void pd_line_node(Biquad *lsh, Biquad *hsh, float *hp, const float *own, const float *other,
-                  float otherSign, const float *px, float fbScale, float *node)
+                  float otherSign, float blur, const float *px, float fbScale, float *node)
 {
-    const float o = 1.0f - 0.49f * LOOP_BLUR, t = 0.51f * LOOP_BLUR;
+    const float o = 1.0f - 0.49f * blur, t = 0.51f * blur;
     const float norm = 1.0f / sqrtf(o * o + t * t);
     const float kOwn = o * norm, kOther = otherSign * t * norm;   /* cos, +-sin */
     for (int n = 0; n < REVERB_BLOCK; n++) {
@@ -4043,10 +4045,11 @@ static void do_predelay(void)
         pd_line_read(&pre_mod_phase_b, &pre_rd_b, predelay_b, wbase, &pre_len_b, modDepth, modInc, rB);
         pd_line_read(&phA_r, &pre_rd_a_r, predelay_a_r, wbase, &pre_len_a_r, modDepth, modInc, rAr);
         pd_line_read(&phB_r, &pre_rd_b_r, predelay_b_r, wbase, &pre_len_b_r, modDepth, modInc, rBr);
-        pd_line_node(&pre_low_shelf_a, &pre_high_shelf_a, &pre_hp_a, rA, rB, 1.0f, pd_px, fbScaleA, pd_node_a);
-        pd_line_node(&pre_low_shelf_b, &pre_high_shelf_b, &pre_hp_b, rB, rA, -1.0f, pd_px, fbScaleB, pd_node_b);
-        pd_line_node(&pre_low_shelf_a_r, &pre_high_shelf_a_r, &pre_hp_a_r, rAr, rBr, 1.0f, pd_px_r, fbScaleA, pd_node_a_r);
-        pd_line_node(&pre_low_shelf_b_r, &pre_high_shelf_b_r, &pre_hp_b_r, rBr, rAr, -1.0f, pd_px_r, fbScaleB, pd_node_b_r);
+        const float blur = LOOP_BLUR * (1.0f - loop_thin_morph);
+        pd_line_node(&pre_low_shelf_a, &pre_high_shelf_a, &pre_hp_a, rA, rB, 1.0f, blur, pd_px, fbScaleA, pd_node_a);
+        pd_line_node(&pre_low_shelf_b, &pre_high_shelf_b, &pre_hp_b, rB, rA, -1.0f, blur, pd_px, fbScaleB, pd_node_b);
+        pd_line_node(&pre_low_shelf_a_r, &pre_high_shelf_a_r, &pre_hp_a_r, rAr, rBr, 1.0f, blur, pd_px_r, fbScaleA, pd_node_a_r);
+        pd_line_node(&pre_low_shelf_b_r, &pre_high_shelf_b_r, &pre_hp_b_r, rBr, rAr, -1.0f, blur, pd_px_r, fbScaleB, pd_node_b_r);
     }
     /* Cross-feed (STEREO_LOOP_XFEED), held off while frozen so a frozen loop
      * keeps exactly what it holds. */

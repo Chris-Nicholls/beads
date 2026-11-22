@@ -24,7 +24,9 @@
 //   OctaveJumps). Patching is sensed by Beads' normalization probe.
 //   DENSITY knob        Density macro (+ DENSITY CV): taps per reverb stage,
 //                       from a sparse few to the full set (the DLD's sound)
-//                       fully clockwise
+//                       fully clockwise. Over the bottom quarter the sustain
+//                       loop's echoes thin to a single train that repeats
+//                       only itself.
 //   DRY/WET knob        Reverb send (equal power; the wet output is at the
 //                       DLD's level, REVERB_OUT_GAIN). The top 10% fades the dry
 //                       signal out, so the knob's end is 100% reverb.
