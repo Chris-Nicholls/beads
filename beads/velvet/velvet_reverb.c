@@ -393,7 +393,6 @@ float reverb_fb_low_shelf_hz   = 124.0f;  /* fixed */
 float reverb_fb_low_shelf_db   = -0.6f;   /* fixed; unused with decay-matched shelves */
 float reverb_fb_high_shelf_hz  = 2000.0f; /* driven by Tone */
 float reverb_fb_high_shelf_db  = -0.25f;  /* fixed; unused with decay-matched shelves */
-float reverb_fb_mod_depth      = 0.032f;  /* fixed */
 float reverb_fb_mod_rate       = 0.35f;   /* fixed */
 float reverb_duck_amount       = 1.0f;    /* fixed */
 /* Duck release, expressed in LOOP TRAVERSALS rather than seconds.
@@ -412,19 +411,31 @@ float reverb_duck_amount       = 1.0f;    /* fixed */
  * means it keeps tracking if the pre-delay times are ever changed. */
 float reverb_duck_release_loops = 1.0f;   /* fixed */
 
-/* T0 per-tap Lexicon LFO (early-reflection smearer; replaces recirc mod).
- * Fixed defaults. */
-float reverb_t0_tap_mod_depth  = 0.26f;
+/* T0 per-tap Lexicon LFO (early-reflection smearer; replaces recirc mod). */
 float reverb_t0_tap_mod_rate   = 0.59f;
 
-/* Modulation amount (velvet_reverb_set_modulation), 0..1: 0 is the depths
- * above; 1 takes T0's per-tap swing to its full ~5 ms and the sustain loop's
- * wobble to MOD_FB_DEPTH_MAX. It glides (MOD_AMOUNT_ALPHA per block, ~0.25 s)
- * so the read heads never jump, and holds while frozen so a frozen loop
- * keeps its exact copy. */
+/* Modulation amount (velvet_reverb_set_modulation), 0..1: how far the
+ * reverb's delays move, T0's taps and the sustain loops' reads together.
+ * Any delay movement, passed through the long velvet stages, turns a steady
+ * tone into level swings (a sine wobbled 10-18 dB at the depths that used to
+ * be fixed), so less is steadier; but with the loops' reads still, each pass
+ * round loop B came back the same and a full, long tail pulsed at its period
+ * (3.3 Hz). The depths go with the square of a share (mod_depth_share) that
+ * runs from 0.2 at 0, a minimum set by ear, to 0.5 at MOD_AMOUNT_DEFAULT, the
+ * middle (about the old fixed depths: T0's swing a quarter of its full ~5 ms,
+ * the loops' 0.04 of PRE_MOD_MAX_SAMPLES), and on to 1 (T0's full swing, the
+ * loops' MOD_FB_DEPTH_MAX). It glides
+ * (MOD_AMOUNT_ALPHA per block, ~0.25 s) so the read heads never jump, landing
+ * exactly, and holds while frozen so a frozen loop keeps its exact copy. */
 #define MOD_FB_DEPTH_MAX    0.16f
 #define MOD_AMOUNT_ALPHA    0.002f
-static float mod_amount_target = 0.0f, mod_amount_morph = 0.0f;
+static float mod_amount_target = MOD_AMOUNT_DEFAULT, mod_amount_morph = MOD_AMOUNT_DEFAULT;
+
+/* The share of the full depths the amount gives, before squaring. */
+static inline float mod_depth_share(float amount)
+{
+    return amount < 0.5f ? 0.2f + 0.6f * amount : amount;
+}
 
 void velvet_reverb_set_modulation(float amount)
 {
@@ -3842,12 +3853,12 @@ static void do_predelay(void)
     timeA = pre_len_a.time;   /* the lengths the loop reads at this block */
     timeB = pre_len_b.time;
 
-    if (freeze_amt == 0.0f)
+    if (freeze_amt == 0.0f) {
         mod_amount_morph += MOD_AMOUNT_ALPHA * (mod_amount_target - mod_amount_morph);
-    float modDepth = reverb_fb_mod_depth;
-    if (modDepth < 0.0f) modDepth = 0.0f; if (modDepth > 1.0f) modDepth = 1.0f;
-    modDepth += mod_amount_morph * (MOD_FB_DEPTH_MAX - modDepth);
-    modDepth *= (float)PRE_MOD_MAX_SAMPLES;
+        if (fabsf(mod_amount_target - mod_amount_morph) < 1e-4f) mod_amount_morph = mod_amount_target;
+    }
+    const float modShare = mod_depth_share(mod_amount_morph);
+    const float modDepth = modShare * modShare * MOD_FB_DEPTH_MAX * (float)PRE_MOD_MAX_SAMPLES;
     float modRate = reverb_fb_mod_rate; if (modRate < 0.0f) modRate = 0.0f;
     float modInc = TWO_PI_F * modRate * inv_fs * (1.0f - freeze_amt);   /* held while frozen */
 
@@ -4336,10 +4347,8 @@ REVERB_CONV_FN static void t0_mod_pass2(const int16_t *ring, int32_t *acc, int n
 
 static void do_t0_phase(void)
 {
-    float depth = reverb_t0_tap_mod_depth;
-    if (depth < 0.0f) depth = 0.0f; if (depth > 1.0f) depth = 1.0f;
-    depth += mod_amount_morph * (1.0f - depth);
-    depth *= T0_TAP_MOD_MAX_SAMPLES;
+    const float share = mod_depth_share(mod_amount_morph);
+    const float depth = share * share * T0_TAP_MOD_MAX_SAMPLES;
     if (t0_ramp_left > 0)
         for (int i = 0; i < REVERB_BLOCK; i++) accT0_p[i] = accT0_r_p[i] = 0;
     if (depth <= 0.0f) {

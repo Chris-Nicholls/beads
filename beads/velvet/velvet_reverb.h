@@ -262,13 +262,11 @@ extern float reverb_fb_low_shelf_hz;
 extern float reverb_fb_low_shelf_db;
 extern float reverb_fb_high_shelf_hz;
 extern float reverb_fb_high_shelf_db;
-extern float reverb_fb_mod_depth;        /* 0..1 (× PRE_MOD_MAX_SAMPLES) */
 extern float reverb_fb_mod_rate;         /* Hz */
 extern float reverb_duck_amount;         /* 0..1 max feedback reduction */
 extern float reverb_duck_release_loops;  /* loop traversals, not seconds */
 
 /* T0 (early-reflection) per-tap Lexicon LFO — golden-angle decorrelated. */
-extern float reverb_t0_tap_mod_depth;    /* 0..1 (× ~5 ms swing) */
 extern float reverb_t0_tap_mod_rate;     /* Hz */
 
 /* ---- API ---- */
@@ -329,7 +327,9 @@ void velvet_reverb_set_octave(int8_t octave);
 /* Freeze: the sustain loop holds what it has, taking no new input and not
  * decaying, while the cascade keeps reverberating it. Ramps over ~20 ms. */
 void velvet_reverb_set_freeze(int on);
-/* Modulation amount 0..1: 0 is the stock depth, 1 the deepest (glides). */
+/* The reverb's modulation, 0..1 (see the .c), gliding; it starts at
+ * MOD_AMOUNT_DEFAULT. */
+#define MOD_AMOUNT_DEFAULT  0.5f
 void velvet_reverb_set_modulation(float amount);
 /* Reverse: nonzero reads the pre-delay loop backwards into the reverb (the
  * loop itself keeps running forwards). Fades in and out over 20 ms. */

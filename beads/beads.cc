@@ -45,13 +45,15 @@
 //   QUALITY button      Picks what the FEEDBACK knob sets: the reverb's
 //                       modulation, then the wet-signal effects sample-rate
 //                       reduction, tape saturation and flutter, in turn.
-//                       Holding it returns all four to zero.
+//                       Holding it returns modulation to noon and the
+//                       effects to zero.
 //   FEEDBACK knob       The selection's amount, once it is moved (a newly
 //                       selected one keeps its amount until then). Modulation
-//                       deepens the reverb's own tap and loop modulation from
-//                       its stock depth at zero. The effects run on the wet
-//                       signal only, after the reverb's final taps and before
-//                       its tone filters (wet_fx.c).
+//                       sets how far the reverb's delays move: a little at
+//                       zero, about the DLD's chorus at noon (where it
+//                       starts), deep at the end. The effects
+//                       run on the wet signal only, after the reverb's final
+//                       taps and before its tone filters (wet_fx.c).
 //   Quality LED         The selection: red = modulation, green = sample-rate
 //                       reduction, amber = saturation, blue = flutter; brighter
 //                       as its amount rises
@@ -161,7 +163,7 @@ const uint32_t kFxHoldMs = 600;
 const int kFxModulation = 0;
 const int kFxSlots = 1 + WET_FX_COUNT;
 volatile uint8_t fx_selected = kFxModulation;
-volatile float fx_amount[kFxSlots] = { 0.0f, 0.0f, 0.0f, 0.0f };
+volatile float fx_amount[kFxSlots] = { MOD_AMOUNT_DEFAULT, 0.0f, 0.0f, 0.0f };
 volatile uint32_t fx_select_seq = 0;
 
 // Written by the main loop, read by the audio callback.
@@ -193,7 +195,9 @@ void SysTick_Handler() {
   static bool media_hold_fired = false;
   if (switches.pressed(SWITCH_MEDIA)) {
     if (++media_held_ms == kFxHoldMs) {
-      for (int i = 0; i < kFxSlots; ++i) fx_amount[i] = 0.0f;
+      for (int i = 0; i < kFxSlots; ++i) {
+        fx_amount[i] = (i == kFxModulation) ? MOD_AMOUNT_DEFAULT : 0.0f;
+      }
       ++fx_select_seq;
       media_hold_fired = true;
     }
