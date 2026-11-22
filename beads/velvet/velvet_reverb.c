@@ -569,15 +569,15 @@ uint32_t host_dbg_t2_gather_late  = 0;
  * space: the stage windows, which set both the tap spacing and the T1/T2 tap
  * fades, and the sustain loops' lengths. Every mapped param uses the full macro
  * range — macro value u lerps bound_min..bound_max (exp where both > 0). */
-/* Density: tap count per stage, from DENSITY_Tx_MIN at Density 0 to the full
- * MAX_Tx_TAPS at 1. The cascade is serial, so a stage needs one tap or the
+/* Density: tap count per stage, from DENSITY_Tx_MIN to the full MAX_Tx_TAPS.
+ * Turning down from the top, the stages thin one after another: T0 over the
+ * top third of the knob, then T1 over the middle third, then T2 over the
+ * bottom third, each exponentially in its own third. So the early taps go
+ * first, then the middle stage's, and the long last stage, which carries the
+ * tail, thins last. The cascade is serial, so a stage needs one tap or the
  * reverb goes silent; at one tap in every stage the cascade is a single
- * path, and what is left is the sustain engine's loops (echoes, not a wash).
- * The knob is shaped so the sparse end, where each tap is heard and every
- * one counts, gets most of the travel: the count is exponential in
- * u^DENSITY_CURVE, so (at Size's midpoint) half the knob covers 1 to ~2
- * taps a stage and the last quarter goes from ~6 to the full set. Counts are fractional: the tap
- * at the boundary is part-faded. */
+ * path, and what is left is the sustain engine's loops (echoes, not a
+ * wash). Counts are fractional: the tap at the boundary is part-faded. */
 /* The fewest taps Density keeps, as a share of each stage's whole span: the
  * DLD's one tap in its 40 (32 for T2) at the midpoint window, so the sparse
  * end keeps the DLD's taps per second too. T2's span is 3.25 s rather than
@@ -586,7 +586,7 @@ uint32_t host_dbg_t2_gather_late  = 0;
 #define DENSITY_T0_MIN  ((float)MAX_T0_TAPS / 40.0f)
 #define DENSITY_T1_MIN  ((float)MAX_T1_TAPS / 40.0f)
 #define DENSITY_T2_MIN  ((float)MAX_T2_TAPS / 32.0f * T2_SPAN_MAX_S / 8.0f)
-#define DENSITY_CURVE   2.5f      /* applied as u * u * sqrt(u) */
+#define DENSITY_THIN_U  0.25f     /* the bottom of the knob that thins the loop (see loop_thin_target) */
 float reverb_t0_count_target = (float)MAX_T0_TAPS;   /* driven by Density */
 float reverb_t1_count_target = (float)MAX_T1_TAPS;
 float reverb_t2_count_target = (float)MAX_T2_TAPS;
@@ -700,6 +700,19 @@ void velvet_reverb_recompute_macros(void)
             *mp->target = val;
         }
     }
+    /* Density's stages, one after another (see DENSITY_T0_MIN). */
+    {
+        float v = reverb_macros[MACRO_DENSITY].value;
+        if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
+        static const macro_param_id_t ids[3] = { MP_T2_COUNT, MP_T1_COUNT, MP_T0_COUNT };
+        for (int k = 0; k < 3; k++) {
+            /* Stage ids[k] thins over the k-th third from the bottom. */
+            float x = v * 3.0f - (float)k;
+            if (x < 0.0f) x = 0.0f; else if (x > 1.0f) x = 1.0f;
+            const macro_param_t *mp = &reverb_macro_params[ids[k]];
+            *mp->target = mp->bound_min * powf(mp->bound_max / mp->bound_min, x);
+        }
+    }
 #if REVERB_LOOP_FB_CURVE
     float d = reverb_macros[MACRO_DECAY].value;
     if (reverb_loop_curve_on && d < reverb_loop_curve_join) {
@@ -771,7 +784,6 @@ void velvet_reverb_apply_tone_macro   (float v) { PROF_PANEL_IGNORED(); set_macr
  * become one, and the loops' blur turns down to none, so that train repeats
  * only itself instead of multiplying. Line A keeps recirculating, so turning
  * back up brings its tail straight back. */
-#define DENSITY_THIN_U  0.25f
 static float loop_thin_target = 0.0f, loop_thin_morph = 0.0f;   /* 0 = both lines, 1 = B only */
 
 /* ==== Input delay (the panel's pre-delay) ====
@@ -812,7 +824,7 @@ void velvet_reverb_apply_density_macro(float v)
 {
     PROF_PANEL_IGNORED();
     if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
-    set_macro_value(MACRO_DENSITY, v * v * sqrtf(v));   /* u^DENSITY_CURVE */
+    set_macro_value(MACRO_DENSITY, v);
     float x = 1.0f - v * (1.0f / DENSITY_THIN_U);
     if (x < 0.0f) x = 0.0f;
     loop_thin_target = x * x * (3.0f - 2.0f * x);
@@ -1723,38 +1735,45 @@ static inline float density_fade(float rank, float count_morph)
     return x * x * (3.0f - 2.0f * x);
 }
 
-/* Density wander: below the full set, the taps that sound don't stay put, or
- * a sparse stage would repeat one fixed rhythm. The taps are laid end to end
- * round a circle in rank order, each taking up a length by how much it
- * matters (1 for a tap within WANDER_ELIG of the stage's loudest, less for
- * quieter ones, so the T0 taper and the T1/T2 fades leave the near-silent
- * taps almost no room). A window as long as the tap count slides round it at
- * WANDER_*_HZ taps a second, and each tap sounds by how much of it the window
- * covers: one tap fades out at the window's back as the next fades in at its
- * front. Below half the full set it wanders fully; above, it blends back to
- * the fixed rank order, which the full set (no wander) is exactly. The energy
- * compensation holds the level as it goes. */
-/* Slow, so a tap comes and goes over seconds rather than being heard to
- * switch: at T0's 0.4 taps a second each tap has 2.5 s, half of it spent
- * fading (WANDER_SHARP 2), each fade on an S-curve. */
-#ifndef WANDER_T0_HZ
-#define WANDER_T0_HZ  0.4f
-#endif
-#ifndef WANDER_T1_HZ
-#define WANDER_T1_HZ  0.26f
-#endif
-#ifndef WANDER_T2_HZ
-#define WANDER_T2_HZ  0.16f
-#endif
-#define WANDER_ELIG   0.1f     /* energy, relative to the loudest tap: -10 dB */
-#ifndef WANDER_SHARP
-#define WANDER_SHARP  2.0f     /* half of each tap's time is spent changing over */
-#endif
+/* Density wander, in T2 only: below its full set, the taps that sound don't
+ * stay put, or the sparse long stage would repeat one fixed rhythm through
+ * the whole tail (T0 and T1 just thin, in the fixed order of compute_tap_ranks,
+ * which keeps them velvet); but every pattern it moves through is velvet,
+ * one tap to each stretch of the stage. A stage thinned to
+ * K taps is split into K equal stretches of its span, velvet's cells, and
+ * each stretch sounds one of the stage's taps that fall in it (the full set
+ * has several to each at these counts; a stretch with none is left as the
+ * gap velvet allows). Each stretch moves on to another of its own taps every
+ * WANDER_TURN_S, chosen at random, the stretches at staggered times; the
+ * change is an equal-power crossfade between the two taps of that stretch
+ * over the last WANDER_FADE_S of the turn. Over the last tap's worth of
+ * the count, up to the full set, the pattern fades into the full set, which
+ * (no wander) is exactly as before. The energy compensation holds the level
+ * as it goes. */
+/* At full speed each stretch keeps a tap for WANDER_TURN_S, the last
+ * WANDER_FADE_S of it fading to the next, so the tail keeps changing without
+ * a tap being heard to switch. */
+#define WANDER_TURN_S  5.0f
+#define WANDER_FADE_S  2.0f
+#define WANDER_ELIG    0.1f     /* energy, relative to the loudest tap: -10 dB */
+#define WANDER_MAX_TAPS  (MAX_T0_TAPS > MAX_T1_TAPS ? (MAX_T0_TAPS > MAX_T2_TAPS ? MAX_T0_TAPS : MAX_T2_TAPS) \
+                                                   : (MAX_T1_TAPS > MAX_T2_TAPS ? MAX_T1_TAPS : MAX_T2_TAPS))
+/* Any change of pattern other than a turn (the knob moving the count, Size
+ * moving the span) is smoothed per tap over about WANDER_GLIDE_S, so it is a
+ * short fade rather than a tap switched in a couple of milliseconds, heard
+ * as zipping while Density turns. And the number of stretches changes in
+ * whole steps, with WANDER_HYST of a tap's hysteresis, so a slow turn changes
+ * it once per step rather than back and forth. */
+#define WANDER_GLIDE_S   0.12f
+#define WANDER_HYST      0.75f
 typedef struct {
-    float pos;                 /* window start, as a fraction of the circle */
+    float pos;                 /* each stretch's progress through its taps, in taps */
+    uint32_t seed;             /* which taps the stretches pick (L and R differ) */
     uint32_t last_block;       /* block of the last recompute */
+    int stretches;             /* 0 until the wander first runs */
+    float w[WANDER_MAX_TAPS];  /* each tap's weight, gliding */
 } WanderState;
-static WanderState t0_wander, t1_wander, t2_wander, t2_wander_r;
+static WanderState t2_wander, t2_wander_r;
 static uint8_t t0TapOrder[MAX_T0_TAPS], t1TapOrder[MAX_T1_TAPS], t2TapOrder[MAX_T2_TAPS];  /* tap index by rank */
 static uint32_t wander_blocks;      /* blocks run, for the wander's clock */
 static uint8_t density_wandering;   /* any stage wandering: keep its gains recomputing */
@@ -1787,15 +1806,35 @@ static void build_tap_order(const float *ranks, uint8_t *order, int n)
     }
 }
 
-/* Thins pre[] (the stage's taps before Density) to the count, with the wander,
- * and returns the thinned energy. */
-static float density_apply(float *pre, const float *ranks, const uint8_t *order, int n,
-                           float count_morph, WanderState *ws, float hz)
+/* A stretch's choice of tap for its v-th turn: any of its n, at random. */
+static inline uint32_t wander_pick(uint32_t seed, uint32_t run, uint32_t v, uint32_t n)
 {
-    const float amt = wander_amount(count_morph, n);
+    uint32_t h = seed ^ (run * 0x9E3779B1u) ^ (v * 0x85EBCA77u);
+    h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; h *= 0x297A2D39u; h ^= h >> 15;
+    return h % n;
+}
+
+/* Thins pre[] (the stage's taps before Density, in time order, at offsets
+ * off[]) to the count, with the wander if ws is given, and returns the
+ * thinned energy. */
+static float density_apply(float *pre, const uint32_t *off, const float *ranks, const uint8_t *order, int n,
+                           float count_morph, WanderState *ws)
+{
+    (void)order;
+    if (!ws) {
+        float thin = 0.0f;
+        for (int t = 0; t < n; t++) {
+            pre[t] *= density_fade(ranks[t], count_morph);
+            thin += pre[t] * pre[t];
+        }
+        return thin;
+    }
+    const float speed = wander_amount(count_morph, n);
+    const float dt = (float)(wander_blocks - ws->last_block) * ((float)REVERB_BLOCK / (float)REVERB_FS_HZ);
+    ws->last_block = wander_blocks;
     float thin = 0.0f;
-    if (amt <= 0.0f) {
-        ws->last_block = wander_blocks;
+    if (count_morph >= (float)n || !DENSITY_WANDER) {
+        ws->stretches = 0;
         for (int t = 0; t < n; t++) {
             pre[t] *= density_fade(ranks[t], count_morph);
             thin += pre[t] * pre[t];
@@ -1803,58 +1842,84 @@ static float density_apply(float *pre, const float *ranks, const uint8_t *order,
         return thin;
     }
 
-    float emax = 0.0f;
-    for (int t = 0; t < n; t++) { const float e = pre[t] * pre[t]; if (e > emax) emax = e; }
-    float a[MAX_T0_TAPS > MAX_T1_TAPS ? (MAX_T0_TAPS > MAX_T2_TAPS ? MAX_T0_TAPS : MAX_T2_TAPS)
-                                      : (MAX_T1_TAPS > MAX_T2_TAPS ? MAX_T1_TAPS : MAX_T2_TAPS)];
-    float p[sizeof a / sizeof a[0]];
-    float A = 0.0f;
-    const float inv = (emax > 0.0f) ? 1.0f / (WANDER_ELIG * emax) : 0.0f;
-    for (int k = 0; k < n; k++) {
-        const int t = order[k];
-        float x = pre[t] * pre[t] * inv;
-        if (x > 1.0f) x = 1.0f;
-        a[t] = x; p[t] = A; A += x;
-    }
+    /* The taps in the span now (Size leaves the rest silent), and the count
+     * as a share of them. */
+    uint8_t idx[WANDER_MAX_TAPS];
+    int ne = 0;
+    for (int t = 0; t < n; t++) if (pre[t] != 0.0f) idx[ne++] = (uint8_t)t;
+    if (ne == 0) return 0.0f;
+    float K = count_morph / (float)n * (float)ne;
+    if (K > (float)ne) K = (float)ne;
+    if (K < 1.0f) K = 1.0f;
+    const int entering = (ws->stretches == 0);
+    if (entering || fabsf(K - (float)ws->stretches) > WANDER_HYST) ws->stretches = (int)(K + 0.5f);
+    if (ws->stretches < 1) ws->stretches = 1;
+    if (ws->stretches > ne) ws->stretches = ne;
+    K = (float)ws->stretches;
 
-    const float dt = (float)(wander_blocks - ws->last_block) * ((float)REVERB_BLOCK / (float)REVERB_FS_HZ);
-    ws->last_block = wander_blocks;
-    if (A > 1e-3f) {
-        ws->pos += hz * amt * dt / A;
-        ws->pos -= floorf(ws->pos);
-    }
-    /* The count is over the whole span; the window keeps that share of the
-     * taps the circle holds (those in the window that matter). */
-    const float o = ws->pos * A, c = count_morph / (float)n * A;
+    ws->pos += speed * dt * (1.0f / WANDER_TURN_S);
+    /* The fade as a share of a stretch's time on a tap (which lengthens as
+     * the wander slows), so it stays WANDER_FADE_S long. */
+    float fadeShare = (speed > 0.0f) ? WANDER_FADE_S * speed * (1.0f / WANDER_TURN_S) : 0.5f;
+    if (fadeShare > 0.5f) fadeShare = 0.5f;
+    if (ws->pos >= 65536.0f) ws->pos -= 65536.0f;
 
-    for (int t = 0; t < n; t++) {
-        float ww = 1.0f;
-        if (c < A) {
-            ww = 0.0f;
-            if (a[t] > 1e-6f) {
-                const float s0 = p[t], s1 = p[t] + a[t];
-                /* the window, and its part that wraps past the end of the circle */
-                float lo = o > s0 ? o : s0, hi = (o + c) < s1 ? (o + c) : s1;
-                float ov = hi > lo ? hi - lo : 0.0f;
-                lo = (o - A) > s0 ? (o - A) : s0; hi = (o + c - A) < s1 ? (o + c - A) : s1;
-                if (hi > lo) ov += hi - lo;
-                /* As a share of the most this tap can get: all of it, or
-                 * the whole window when that is shorter than the tap. */
-                const float most = c < a[t] ? c / a[t] : 1.0f;
-                ww = ov / a[t] / most;
-                /* Hold each tap and change over quickly, rather than always
-                 * being midway between two: a sparse stage then mostly
-                 * sounds just the taps it has, not twice as many at part
-                 * level. */
-                ww = (ww - 0.5f) * WANDER_SHARP + 0.5f;
-                if (ww < 0.0f) ww = 0.0f; else if (ww > 1.0f) ww = 1.0f;
-                ww = ww * ww * (3.0f - 2.0f * ww);   /* ease in and out of each fade */
-            }
+    float w[sizeof idx / sizeof idx[0]];
+    for (int i = 0; i < ne; i++) w[i] = 0.0f;
+    /* K equal stretches of the span, which runs from the first tap to one
+     * average gap past the last. */
+    const float first = (float)off[idx[0]];
+    float span = (float)off[idx[ne - 1]] - first;
+    if (ne > 1) span *= (float)ne / (float)(ne - 1);
+    const float perUnit = (span > 0.0f) ? K / span : 0.0f;
+    int start = 0;
+    while (start < ne) {
+        const uint32_t run = (uint32_t)(((float)off[idx[start]] - first) * perUnit);
+        int end = start + 1;
+        while (end < ne && (uint32_t)(((float)off[idx[end]] - first) * perUnit) == run) end++;
+        /* The stretch's taps that can carry it: those within WANDER_ELIG of
+         * its loudest (a tap deep in the stretch's decay, made up to the
+         * stage's level, would need more than the compensation gives, and
+         * the stage would drop out). */
+        uint8_t cand[WANDER_MAX_TAPS];
+        float emax = 0.0f;
+        for (int i = start; i < end; i++) { const float e = pre[idx[i]] * pre[idx[i]]; if (e > emax) emax = e; }
+        uint32_t len = 0;
+        for (int i = start; i < end; i++) if (pre[idx[i]] * pre[idx[i]] >= WANDER_ELIG * emax) cand[len++] = (uint8_t)i;
+        if (len == 1) {
+            w[cand[0]] = 1.0f;
+        } else {
+            /* Staggered: each stretch is a golden-ratio share of a turn apart. */
+            float stag = (float)run * 0.618034f + (float)(ws->seed & 0xFFu) * (1.0f / 256.0f);
+            stag -= floorf(stag);
+            const float ph = ws->pos + stag;
+            const uint32_t v = (uint32_t)ph;
+            float x = (ph - (float)v - (1.0f - fadeShare)) / fadeShare;
+            if (x < 0.0f) x = 0.0f; else if (x > 1.0f) x = 1.0f;
+            x = x * x * (3.0f - 2.0f * x);
+            const uint32_t cur = wander_pick(ws->seed, run, v, len);
+            uint32_t nxt = wander_pick(ws->seed, run, v + 1u, len);
+            if (nxt == cur) nxt = (cur + 1u) % len;
+            const float a = 0.5f * PI_F * x;
+            w[cand[cur]] += cosf(a);
+            w[cand[nxt]] += sinf(a);
         }
-        const float sw = density_fade(ranks[t], count_morph);
-        pre[t] *= sw + amt * (ww - sw);
-        thin += pre[t] * pre[t];
+        start = end;
     }
+    /* Over the last tap of the count, into the full set. */
+    const float top = count_morph - (float)(n - 1);
+    float full[sizeof idx / sizeof idx[0]];
+    for (int t = 0; t < n; t++) full[t] = 0.0f;
+    for (int i = 0; i < ne; i++) full[idx[i]] = w[i];
+    const float glide = 1.0f - expf(-dt * (1.0f / WANDER_GLIDE_S));
+    for (int t = 0; t < n; t++) {
+        float g = full[t];
+        if (top > 0.0f) g += top * (1.0f - g);
+        if (entering) ws->w[t] = (pre[t] != 0.0f) ? 1.0f : 0.0f;   /* from the full set */
+        ws->w[t] += glide * (g - ws->w[t]);
+        pre[t] *= ws->w[t];
+    }
+    for (int t = 0; t < n; t++) thin += pre[t] * pre[t];
     return thin;
 }
 
@@ -2124,11 +2189,10 @@ void velvet_reverb_init(void)
     t0_count_morph = reverb_t0_count_target;
     t1_count_morph = reverb_t1_count_target;
     t2_count_morph = reverb_t2_count_target;
-    memset(&t0_wander, 0, sizeof t0_wander);
-    memset(&t1_wander, 0, sizeof t1_wander);
     memset(&t2_wander, 0, sizeof t2_wander);
     memset(&t2_wander_r, 0, sizeof t2_wander_r);
-    t2_wander_r.pos = 0.5f;   /* R starts across the circle from L */
+    t2_wander.seed = 0x51ED270Bu;
+    t2_wander_r.seed = 0xA3C59AC3u;   /* R picks its own taps */
     wander_blocks = 0;
     density_wandering = 0;
     t0_window_morph = reverb_t0_window_ms_target * (float)REVERB_FS_HZ / 1000.0f;
@@ -2468,8 +2532,8 @@ static void compute_tap_states_lr(const uint32_t *ladderL, const uint32_t *ladde
  * smoothed. Capped at what a single tap needs; clamp_f_to_int16 holds the
  * resulting gains inside int16. */
 /* A safety limit only: one tap standing in for a whole stage (116 in T0) can
- * need sqrt(116) ~ 11, and more if it is one of the stage's quieter taps (up
- * to 10 dB down, see WANDER_ELIG). Gains past what a Q15 gain holds are
+ * need sqrt(116) ~ 11, and more if it is one of the stage's quieter taps
+ * (the wander picks any tap of a run). Gains past what a Q15 gain holds are
  * carried by the stage's make-up instead (see stage_fit). */
 #define DENSITY_COMP_MAX  40.0f
 /* A stage's gains past what a Q15 gain holds (a few taps carrying the whole
@@ -2563,7 +2627,7 @@ static void recompute_eff_gains_t0(void)
         energy += g * g;
         pre[t] = g;
     }
-    thinEnergy = density_apply(pre, t0TapRanks, t0TapOrder, count, t0_count_morph, &t0_wander, WANDER_T0_HZ);
+    thinEnergy = density_apply(pre, effOffT0, t0TapRanks, t0TapOrder, count, t0_count_morph, NULL);
     const float densComp = density_comp(energy, thinEnergy);
     for (int t = 0; t < count; t++) pre[t] *= densComp;
 
@@ -2628,7 +2692,7 @@ static void recompute_eff_gains_t1(void)
         energy += g * g;
         pre[t] = g;
     }
-    thinEnergy = density_apply(pre, t1TapRanks, t1TapOrder, count, t1_count_morph, &t1_wander, WANDER_T1_HZ);
+    thinEnergy = density_apply(pre, effOffT1, t1TapRanks, t1TapOrder, count, t1_count_morph, NULL);
     const float densComp = density_comp(energy, thinEnergy);
     for (int t = 0; t < count; t++) pre[t] *= densComp;
 
@@ -2719,8 +2783,8 @@ static void recompute_eff_gains_t2(void)
      * every tap, as before. */
     float preR[MAX_T2_TAPS];
     for (int t = 0; t < count; t++) preR[t] = pre[t];
-    thinEnergy = density_apply(pre, t2TapRanks, t2TapOrder, count, t2_count_morph, &t2_wander, WANDER_T2_HZ);
-    const float thinEnergyR = density_apply(preR, t2TapRanks, t2TapOrder, count, t2_count_morph, &t2_wander_r, WANDER_T2_HZ);
+    thinEnergy = density_apply(pre, effOffT2L, t2TapRanks, t2TapOrder, count, t2_count_morph, &t2_wander);
+    const float thinEnergyR = density_apply(preR, effOffT2R, t2TapRanks, t2TapOrder, count, t2_count_morph, &t2_wander_r);
     float densComp = density_comp(energy, thinEnergy), densCompR = density_comp(energy, thinEnergyR);
     if (refEnergy != energy && energy > 1e-6f) { const float k = sqrtf(refEnergy / energy); densComp *= k; densCompR *= k; }
     for (int t = 0; t < count; t++) { pre[t] *= densComp; preR[t] *= densCompR; }
@@ -2778,9 +2842,7 @@ static void update_morph_state(void)
     wander_blocks++;
     loop_thin_morph += ALPHA_WINDOW_MORPH * (loop_thin_target - loop_thin_morph);
     if (fabsf(loop_thin_target - loop_thin_morph) < 1e-5f) loop_thin_morph = loop_thin_target;
-    density_wandering = wander_amount(t0_count_morph, t0TapCount) > 0.0f ||
-                        wander_amount(t1_count_morph, t1TapCount) > 0.0f ||
-                        wander_amount(t2_count_morph, t2TapCount) > 0.0f;
+    density_wandering = wander_amount(t2_count_morph, t2TapCount) > 0.0f;
     float t0_win_target = reverb_t0_window_ms_target  * (float)REVERB_FS_HZ / 1000.0f;
     float t1_win_target = reverb_t1_window_ms_target  * (float)REVERB_FS_HZ / 1000.0f;
     float t2_win_target = reverb_t2_duration_s_target * (float)REVERB_FS_HZ;
