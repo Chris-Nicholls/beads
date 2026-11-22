@@ -62,8 +62,9 @@ extern "C" {
  * overlap the T2 ring and the right delay would intermittently play back
  * T2 audio (the prior bug: a 24-kHz reverb tail played at 48 kHz reads as
  * an octave-up "ghost"). */
-/* On the Beads: T2's span stops at T2_DURATION_MAX_SAMPLES (3.25 s), so the
- * ring is the next power of two, 131072 (5.5 s, 256 KiB of RAM_D1). */
+/* On the Beads: the ring is 131072 (5.46 s, 256 KiB of RAM_D1), and T2's
+ * span runs to T2_DURATION_MAX_SAMPLES (5.33 s), using it all but the block
+ * fetch's margin. */
 #define T2_RING_SAMPLES  (131072UL * REVERB_RATE_MULT)
 /* The reverb is stereo throughout: each channel has its own T2 ring, which
  * that side's taps read. */
@@ -183,17 +184,18 @@ extern float beads_predelay_b_r_storage[PRE_DELAY_LINE_SAMPLES];
 #define MAX_T1_TAPS  50
 #endif
 #ifndef MAX_T2_TAPS
-#define MAX_T2_TAPS  80
+#define MAX_T2_TAPS  130
 #endif
 
 /* ---- Maximum windows (samples at fs_reverb, also user-tunable upper bounds) ---- */
 #define T0_WINDOW_MAX_SAMPLES   (4800 * REVERB_RATE_MULT)     /* 200 ms */
 #define T1_WINDOW_MAX_SAMPLES   (16000 * REVERB_RATE_MULT)    /* ~666 ms */
-/* 3.25 s: just past the DLD's 3.217 s at Size's midpoint, so Size changes
- * nothing up to there and holds T2 at that span above it (the decay keeps
- * lengthening through the loop). The 80 taps over it are ~2.5x the DLD's. */
-#define T2_SPAN_MAX_S           3.25f
-#define T2_DURATION_MAX_SAMPLES (78000 * REVERB_RATE_MULT)    /* 3.25 s */
+/* 5.33 s, as far as the T2 ring reaches less 3072 samples for the block
+ * fetch: Size's midpoint is the DLD's 3.217 s, and its upper half stretches
+ * T2 on to this (the decay lengthening through the loop as well). The 130
+ * taps over it are ~24 a second, ~2.5x the DLD's. */
+#define T2_SPAN_MAX_S           5.3333333f
+#define T2_DURATION_MAX_SAMPLES (128000 * REVERB_RATE_MULT)   /* 5.33 s */
 
 #ifndef TAP_GAIN_HEADROOM
 #define TAP_GAIN_HEADROOM  1.0f

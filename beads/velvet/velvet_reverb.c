@@ -239,7 +239,7 @@ int      t2TapCount = 0;
  * compute_tap_states walks as the window changes. Each tap now has a single
  * rung, its own position (see build_single_rung_ladders), so a tap sounds once
  * the window reaches it and is silent before. Offsets are uint32_t: T2's run
- * up to T2_DURATION_MAX_SAMPLES (78000). */
+ * up to T2_DURATION_MAX_SAMPLES (128000). */
 static uint32_t t0TapLadder [MAX_T0_TAPS * MAX_LADDER_LEVELS] CCM_ATTR;
 static uint8_t  t0TapLadderCount[MAX_T0_TAPS]                 CCM_ATTR;
 static uint32_t t1TapLadder [MAX_T1_TAPS * MAX_LADDER_LEVELS] CCM_ATTR;
@@ -579,13 +579,14 @@ uint32_t host_dbg_t2_gather_late  = 0;
  * path, and what is left is the sustain engine's loops (echoes, not a
  * wash). Counts are fractional: the tap at the boundary is part-faded. */
 /* The fewest taps Density keeps, as a share of each stage's whole span: the
- * DLD's one tap in its 40 (32 for T2) at the midpoint window, so the sparse
- * end keeps the DLD's taps per second too. T2's span is 3.25 s rather than
- * the 8 s that rate was set over, so its floor is scaled to match: the sparse
- * end is unchanged and only the dense end rises (to ~2.5x). */
+ * DLD's one tap in its 40 at the midpoint window for T0 and T1, so the
+ * sparse end keeps the DLD's taps per second too. T2's is a rate, 0.31 taps a
+ * second over its whole span (about one tap in its window at Size's
+ * midpoint), as it was when the span was 3.25 s with 80 taps; its dense end
+ * is ~2.5x the DLD's. */
 #define DENSITY_T0_MIN  ((float)MAX_T0_TAPS / 40.0f)
 #define DENSITY_T1_MIN  ((float)MAX_T1_TAPS / 40.0f)
-#define DENSITY_T2_MIN  ((float)MAX_T2_TAPS / 32.0f * T2_SPAN_MAX_S / 8.0f)
+#define DENSITY_T2_MIN  (0.3125f * T2_SPAN_MAX_S)
 #define DENSITY_THIN_U  0.25f     /* the bottom of the knob that thins the loop (see loop_thin_target) */
 float reverb_t0_count_target = (float)MAX_T0_TAPS;   /* driven by Density */
 float reverb_t1_count_target = (float)MAX_T1_TAPS;
@@ -1393,6 +1394,12 @@ static void pd_init(void);
 static int16_t  t2_gather[T2_GATHER_ROWS][T2_GATHER_SPAN] __attribute__((aligned(4)));
 static uint32_t t2_gather_off[T2_GATHER_ROWS];       /* offset each row was fetched at */
 static uint32_t t2_gather_bw;                        /* block_write_idx of the rows' first block */
+static int      t2_gather_count;                     /* taps the rows were fetched for */
+/* T2's taps in use: up to its last tap with a gain, on either side, old or
+ * new (the taps are in time order, and Size silences those past its
+ * window), so T2 costs what the span in use needs, not what the longest
+ * does. Set by the effGains recompute. */
+static int      t2_active;
 static uint8_t  t2_gather_both;                      /* 1 if the second block's windows are final too */
 #define T2G_INVALID  0
 #define T2G_BUSY     1
@@ -1417,7 +1424,8 @@ static int t2_gather_find(uint32_t bw)
     if (t2_gather_state != T2G_READY) return -1;
     const uint32_t d = (bw - t2_gather_bw) & (REVERB_IDX_WRAP - 1u);
     if (!(d == 0u || (d == (uint32_t)REVERB_BLOCK && t2_gather_both))) return -1;
-    const int count = t2TapCount;
+    const int count = t2_active;
+    if (t2_gather_count < count) return -1;
     for (int t = 0; t < count; t++) {
         if (t2_gather_off[t] != effOffT2L[t]) return -1;
         if (t2_gather_off[MAX_T2_TAPS + t] != effOffT2R[t]) return -1;
@@ -1428,7 +1436,8 @@ static int t2_gather_find(uint32_t bw)
 /* Fetch every row in use for block index bw, synchronously, by CPU. */
 static void t2_gather_sync(uint32_t bw)
 {
-    const int count = t2TapCount;
+    const int count = t2_active;
+    t2_gather_count = count;
     uint8_t both = 1;
     for (int r = 0; r < T2_GATHER_ROWS; r++) {
         int t = (r < MAX_T2_TAPS) ? r : r - MAX_T2_TAPS;
@@ -1488,7 +1497,8 @@ static void t2_gather_start(void)
     /* ring_write_idx is the block_write_idx the next block will use. */
     const uint32_t bw = ring_write_idx;
     if (t2_gather_find(bw) >= 0) return;                 /* the rows already hold it */
-    const int count = t2TapCount;
+    const int count = t2_active;
+    t2_gather_count = count;
     uint8_t both = 1;
     T2ChainEntry *e = t2_chain;
     for (int r = 0; r < T2_GATHER_ROWS; r++) {
@@ -2241,6 +2251,8 @@ void velvet_reverb_init(void)
     NVIC_EnableIRQ(DMA2_Stream1_IRQn);
 #endif
     t2_gather_state = T2G_INVALID;
+    t2_gather_count = 0;
+    t2_active = t2TapCount;
     pd_init();
 
     /* Seed effGains arrays so the first 3 blocks (before recompute round-
@@ -2807,6 +2819,10 @@ static void recompute_eff_gains_t2(void)
         if (t2FlipR[t]) effGains_t2R[t] = (int16_t)-effGains_t2R[t];
 #endif
     }
+    int active = count;
+    while (active > 0 && effGains_t2[active - 1] == 0 && effGains_t2R[active - 1] == 0 &&
+           effGains_t2_prev[active - 1] == 0 && effGains_t2R_prev[active - 1] == 0) active--;
+    t2_active = active;
 #ifdef VELVET_REVERB_HOST
     for (int t = 0; t < count; t++) host_effwin_t2[t] = effWin[t];
 #endif
@@ -4551,7 +4567,7 @@ static void do_bridge_t1_to_t2(void)
 
 static void do_t2_phase(void)
 {
-    const int count = t2TapCount;
+    const int count = t2_active;
     if (count > 0) {
         t2_gather_wait();                        /* a chain still in flight lands first */
         int h = t2_gather_find(block_write_idx);
