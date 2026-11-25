@@ -7,13 +7,15 @@
 // cross-feed so an off-centre sound fills both sides as it decays.
 //
 // Panel:
-//   TIME knob           Pre-delay: the whole reverb comes in up to 0.68 s after
-//                       the dry signal (square law, short times get the
-//                       travel)
-//   SIZE knob           The space and its decay together: up to noon the
+//   TIME knob           The space and its decay together: up to noon the
 //                       reverb's taps spread longer, past noon the sustain
 //                       loop's feedback rises (its repeats kept under the
 //                       taps), to full sustain at the top
+//   SIZE knob           Pre-delay: the whole reverb comes in up to 0.68 s after
+//                       the dry signal (square law, short times get the
+//                       travel)
+//   Each knob's attenuverter and CV input go with it: TIME's set the space
+//   and decay, SIZE's the pre-delay.
 //   SHAPE knob          Tone macro
 //   TIME, SIZE, SHAPE and PITCH each have an attenuverter and a CV input, which
 //   work as on Beads (RandomizedParameter): with the CV jack patched, clockwise
@@ -45,7 +47,7 @@
 //                       blend, fully clockwise only the shifted feed
 //   FREEZE button/gate  Freezes the sustain loop: no new input, no decay.
 //                       New input skips the loop and goes straight to the
-//                       reverb's taps (after TIME's pre-delay). The button
+//                       reverb's taps (after SIZE's pre-delay). The button
 //                       latches; the gate freezes while high. The button
 //                       lights while frozen.
 //   SEED button/gate    Reverse: the sustain loop is read backwards into the
@@ -103,7 +105,7 @@ const int kBlockRate = 4000;
 // NOLOAD (never cleared at start-up); velvet_reverb_init() zeroes them.
 //   RAM_D1 (512 KiB): the two T2 rings, 256 KiB each at 24 kHz.
 //   RAM_D2 (256 KiB): the four float sustain-loop lines, 64 KiB each.
-//   RAM_D3 (64 KiB): the two int16 input delay rings (TIME), 32 KiB each.
+//   RAM_D3 (64 KiB): the two int16 input delay rings (SIZE's pre-delay), 32 KiB each.
 // The left T0/T1 rings and all other reverb state are ordinary .bss (DTCM);
 // the right T0/T1 rings are in ITCM (see velvet_reverb.c).
 int16_t beads_t2_ring_storage[T2_RING_SAMPLES] __attribute__ ((section (".ramd1")));
@@ -344,17 +346,19 @@ void Process(
   reversed = reverse_latched || reverse_gate;
 
   RandomizedParameter p;
+  // TIME's knob, attenuverter and CV set the space and decay; SIZE's the
+  // pre-delay.
   p.base = cv_reader.pot(POTS_ADC_CHANNEL_TIME);
   p.attenuverter = cv_reader.pot(POTS_ADC_CHANNEL_TIME_AMOUNT);
   p.has_cv = !nd.normalized(NORMALIZATION_DETECTOR_CHANNEL_TIME_CV);
   p.cv = cv_reader.cv(CV_ADC_CHANNEL_TIME);
-  predelay_target = p.value(&time_walk, size, 1.0f, true);
+  size_target = p.value(&time_walk, size, 1.0f, true);
 
   p.base = cv_reader.pot(POTS_ADC_CHANNEL_SIZE);
   p.attenuverter = cv_reader.pot(POTS_ADC_CHANNEL_SIZE_AMOUNT);
   p.has_cv = !nd.normalized(NORMALIZATION_DETECTOR_CHANNEL_SIZE_CV);
   p.cv = cv_reader.cv(CV_ADC_CHANNEL_SIZE);
-  size_target = p.value(&size_walk, size, 1.0f, true);
+  predelay_target = p.value(&size_walk, size, 1.0f, true);
 
   p.base = cv_reader.pot(POTS_ADC_CHANNEL_SHAPE);
   p.attenuverter = cv_reader.pot(POTS_ADC_CHANNEL_SHAPE_AMOUNT);
