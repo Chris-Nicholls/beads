@@ -2422,11 +2422,11 @@ static inline int16_t soft_clip_int16(float v)
  * in place only to absorb the small overshoot a biquad step response can add on
  * top of the peak measured before it. */
 /* Wet output gain on the Beads, ahead of the limiter so loud tails are
- * limited rather than clipped. It was 2 (twice the DLD's level), but the dry
- * signal is added to the wet after this and with a hot input the sum went
- * over full scale; the DLD's own level leaves room for both. */
+ * limited rather than clipped: half the DLD's level (-6 dB), which sits the
+ * reverb under the dry signal at the mix's noon rather than over it, and
+ * leaves the sum of the two room below full scale with a hot input. */
 #ifndef REVERB_OUT_GAIN
-#define REVERB_OUT_GAIN 1.0f
+#define REVERB_OUT_GAIN 0.5f
 #endif
 #define LIM_CEILING     0.95f    /* of full scale; peak is measured post-biquad  */
 #define SOFT_KNEE_OUT   0.97f    /* output-only knee; bridges keep SOFT_KNEE_T   */
