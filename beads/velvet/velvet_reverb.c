@@ -344,12 +344,13 @@ float reverb_t60_hi_ratio_max = 0.53f;
 float reverb_t60_lo_ratio     = 0.49f;
 static float t60_hs_db, t60_ls_db;   /* the shelf gains they give, dB per trip */
 #endif
+/* How much faster the highs fall than the mids, dB a second: the loop's high
+ * shelf over its trip. T2's taps darken at this rate (see T2_ABS_SEGS). */
+static float t2_abs_db_s = 0.0f;
 
-/* T2's fade lengths (Size): the time T2's taps would take to fall 80 dB at
- * their rate over the first SIZE_HIDE_S, and after it (those that reach
- * -80 dB are silent). See SIZE_TAPS_U. */
+/* T2's fade length (Size): the time T2's taps take to fall 80 dB (those
+ * that reach -80 dB are silent). See SIZE_TAPS_U. */
 float reverb_t2_fade_s_target = 3.217f;
-float reverb_t2_fade_late_s_target = 3.217f;
 float reverb_t0_window_ms_target  = 69.0f;     /* driven by Size  */
 float reverb_t1_window_ms_target  = 536.0f;    /* driven by Size  */
 float reverb_t2_duration_s_target = 3.217f;    /* driven by Size  */
@@ -486,7 +487,7 @@ uint32_t host_dbg_t0_sat_count = 0;
  * broadband hash — which sounds like noise rather than like distortion. */
 float    host_dbg_t01_peak = 0.0f;  uint32_t host_dbg_t01_sat = 0;  /* accT0 -> t1_ring */
 float    host_dbg_t12_peak = 0.0f;  uint32_t host_dbg_t12_sat = 0;  /* accT1 -> t2_ring */
-float    host_dbg_out_peak = 0.0f;  uint32_t host_dbg_out_sat = 0;  /* accL/R -> output  */
+float    host_dbg_out_peak = 0.0f;  uint32_t host_dbg_out_sat = 0;  /* T2 -> output      */
 
 /* The final int16 conversion, measured as a DISTRIBUTION rather than a peak. A
  * peak says only that the ceiling was touched once; what decides the fix is how
@@ -505,12 +506,15 @@ double   host_dbg_final_sumsq = 0.0;
  * SOFT_KNEE_T (0.80), so a peak of 0.98 is already being shaped even though it
  * never reaches full scale — counting against 1.0 reports zero while the stage is
  * distorting steadily. */
-static inline void host_note_sat(int32_t x, float *peak, uint32_t *cnt)
+static inline void host_note_level(float m, float *peak, uint32_t *cnt)
 {
-    float m = (float)x * (1.0f / HOST_Q30_FS);
     if (m < 0.0f) m = -m;
     if (m > *peak) *peak = m;
     if (m > SOFT_KNEE_T) (*cnt)++;
+}
+static inline void host_note_sat(int32_t x, float *peak, uint32_t *cnt)
+{
+    host_note_level((float)x * (1.0f / HOST_Q30_FS), peak, cnt);
 }
 
 /* The ±4 hard clamp on the pre-delay feedback node. A hard clamp is a level
@@ -605,27 +609,23 @@ typedef struct {
  * and the sustain loop's feedback rises, its decay time (T60) reaching
  * SIZE_LOOP_T60_MAX at SIZE_LOOP_TOP of that half, with full sustain above.
  *
- * The loop is kept hidden behind the taps. A loop repeating every t seconds
- * with gain f is heard as repeats unless some tap later than t is louder
- * than f; then each repeat arrives under the taps of the one before it. Each
- * loop's gain is set for one decay rate per second (see LOOP_T60_REF_S), so
- * that holds for both loops while T2's taps decay more slowly than the loop
- * over the longer loop's period, and SIZE_TAPS_SLOWER times as slowly gives
- * a margin. They do so over the first SIZE_HIDE_S, and after it fall
- * SIZE_LATE_FASTER times as fast as the loop, so the tail decays at about
- * one rate and the end of T2's window is lost under the repeats (taps that
- * kept the slow rate to the end would stop there, well above the loop's
- * tail, which the loop's shelves leave weaker than the first pass). While the
- * taps lengthen the loop decays at their window's rate (80 dB over it); once
- * they are at their longest it slows and T2's fades follow it. At full
- * sustain the taps are held all but level (SIZE_FADE_HELD). */
-#define SIZE_TAPS_U         0.5f
-#define SIZE_HIDE_S         0.6f     /* s: twice the longer loop */
-#define SIZE_LATE_FASTER    1.5f
-#define SIZE_LOOP_T60_MAX   60.0f    /* s */
-#define SIZE_LOOP_TOP       0.96f    /* of the loop's half: full sustain above */
-#define SIZE_TAPS_SLOWER    2.0f
-#define SIZE_FADE_HELD      1000.0f  /* s: T2's taps all but level */
+ * The tail decays at one rate. The loop feeds every repeat back through the
+ * whole cascade, so each repeat starts another copy of T2's taps on top of
+ * those still sounding: with T2 at the loop's own rate the copies pile up and
+ * the tail swells before it falls. T2's taps fall SIZE_T2_FASTER_DB_S faster
+ * than the loop instead, about what the repeats add back, so the first pass
+ * fades as the repeats take over and the sum falls in a straight line (in
+ * dB). The loop stays hidden: a repeat is heard only if it is louder than the
+ * taps still sounding from the pass before it, and the loop's feed into the
+ * cascade (reverb_delay_mix) puts each repeat ~8 dB under the first pass, far
+ * more than T2 loses over one loop period. While the taps lengthen the loop
+ * decays at their window's rate (80 dB over it); once they are at their
+ * longest it slows, and T2 follows it. At full sustain the loop holds and T2
+ * falls at SIZE_T2_FASTER_DB_S alone, the repeats keeping the level. */
+#define SIZE_TAPS_U          0.5f
+#define SIZE_LOOP_T60_MAX    60.0f    /* s */
+#define SIZE_LOOP_TOP        0.96f    /* of the loop's half: full sustain above */
+#define SIZE_T2_FASTER_DB_S  1.5f
 #ifndef LOOP_T60_REF_S
 #define LOOP_T60_REF_S      0.27f    /* see LOOP_BLUR */
 #endif
@@ -722,16 +722,13 @@ void velvet_reverb_recompute_macros(void)
         float y = (u - SIZE_TAPS_U) * (1.0f / (1.0f - SIZE_TAPS_U));
         if (y >= SIZE_LOOP_TOP) {
             reverb_feedback = 1.0f;
-            reverb_t2_fade_s_target = reverb_t2_fade_late_s_target = SIZE_FADE_HELD;
+            reverb_t2_fade_s_target = 80.0f / SIZE_T2_FASTER_DB_S;
         } else {
             const float t60 = (y <= 0.0f)
                 ? 0.75f * win
                 : t60_join * powf(SIZE_LOOP_T60_MAX / t60_join, y * (1.0f / SIZE_LOOP_TOP));
             reverb_feedback = powf(10.0f, -3.0f * LOOP_T60_REF_S / t60);
-            /* 80 dB at the slower rate that hides the loop, then a little faster than the loop */
-            const float loop = (4.0f / 3.0f) * t60;
-            reverb_t2_fade_s_target = loop * SIZE_TAPS_SLOWER;
-            reverb_t2_fade_late_s_target = loop * (1.0f / SIZE_LATE_FASTER);
+            reverb_t2_fade_s_target = 80.0f / (60.0f / t60 + SIZE_T2_FASTER_DB_S);
         }
     }
 #if REVERB_LOOP_T60_SHELVES
@@ -745,6 +742,7 @@ void velvet_reverb_recompute_macros(void)
         t60_hs_db = mid_db * (1.0f / hi_r - 1.0f);
         t60_ls_db = mid_db * (1.0f / reverb_t60_lo_ratio - 1.0f);
     }
+    t2_abs_db_s = reverb_t60_shelves_on ? -t60_hs_db * (1.0f / LOOP_T60_REF_S) : 0.0f;
 #endif
 }
 
@@ -845,7 +843,6 @@ static float t0_window_morph;       /* samples at fs_reverb */
 static float t1_window_morph;
 static float t2_window_morph;
 static float t2_fade_morph;         /* samples (Size) */
-static float t2_fade_late_morph;    /* samples (Size) */
 static float t0_tap_comp_morph;
 static float t1_tap_comp_morph;
 static float t2_tap_comp_morph;
@@ -1104,8 +1101,6 @@ static int32_t accT0[REVERB_BLOCK] CCM_ATTR;
 static int32_t accT1[REVERB_BLOCK] CCM_ATTR;
 static int32_t accT0_r[REVERB_BLOCK] CCM_ATTR;
 static int32_t accT1_r[REVERB_BLOCK] CCM_ATTR;
-static int32_t accL [REVERB_BLOCK] CCM_ATTR;
-static int32_t accR [REVERB_BLOCK] CCM_ATTR;
 
 /* Accumulator blocking.
  *
@@ -1210,8 +1205,9 @@ static inline float smoothstep01(float x)
     return x * x * (3.0f - 2.0f * x);
 }
 /* Per-tap T2 exponential decay envelope (frac ∈ [0,1] = effOff / window).
- * exp falls to ~1e-4 (-80 dB) across the window. T0 has taper baked in;
- * T1 has no decay envelope. Uses exp_env_lut (filled in velvet_reverb_init). */
+ * exp falls to ~1e-4 (-80 dB) across the window. T0 and T1 use it too, for
+ * their fixed rates (early_env_depth_db). Uses exp_env_lut (filled in
+ * velvet_reverb_init). */
 #define ENV_FRAC_BINS  32
 static float exp_env_lut[ENV_FRAC_BINS] CCM_ATTR;
 
@@ -1303,12 +1299,11 @@ static void biquad_lowshelf(Biquad *bq, float freq, float dB, float fs)
     bq->a1 = -2.0f * ((A - 1.0f) + (A + 1.0f) * cosw) / a0;
     bq->a2 =  ((A + 1.0f) + (A - 1.0f) * cosw - tsa) / a0;
 }
-static void biquad_highshelf(Biquad *bq, float freq, float dB, float fs)
+/* The high shelf from its corner's cos(w0) and alpha (sin(w0) / sqrt(2)), so
+ * shelves sharing a corner share them. */
+static void biquad_highshelf_cs(Biquad *bq, float cosw, float alpha, float dB)
 {
     float A = powf(10.0f, dB / 40.0f);
-    float w0 = TWO_PI_F * freq / fs;
-    float cosw = cosf(w0);
-    float alpha = sinf(w0) * 0.5f * 1.41421356f;
     float tsa = 2.0f * sqrtf(A) * alpha;
     float a0 = (A + 1.0f) - (A - 1.0f) * cosw + tsa;
     bq->b0 =  A * ((A + 1.0f) + (A - 1.0f) * cosw + tsa) / a0;
@@ -1316,6 +1311,11 @@ static void biquad_highshelf(Biquad *bq, float freq, float dB, float fs)
     bq->b2 =  A * ((A + 1.0f) + (A - 1.0f) * cosw - tsa) / a0;
     bq->a1 =  2.0f * ((A - 1.0f) - (A + 1.0f) * cosw) / a0;
     bq->a2 =  ((A + 1.0f) - (A - 1.0f) * cosw - tsa) / a0;
+}
+static void biquad_highshelf(Biquad *bq, float freq, float dB, float fs)
+{
+    float w0 = TWO_PI_F * freq / fs;
+    biquad_highshelf_cs(bq, cosf(w0), sinf(w0) * 0.5f * 1.41421356f, dB);
 }
 /* Each filter here comes as a matched pair (output L/R, pre-delay lines A/B) with
  * identical coefficients and separate state. Design once and copy the
@@ -1589,6 +1589,45 @@ REVERB_CONV_FN static void t2_conv_blocked(const int16_t *rows, int32_t *acc, in
         }
         acc[c] = a0; acc[c+1] = a1; acc[c+2] = a2; acc[c+3] = a3;
     }
+}
+
+/* ==== T2's absorption ====
+ * Air and walls take the highs faster than the mids, so a room's tail darkens
+ * as it decays. The sustain loop does that with its shelves (each pass loses
+ * t60_hs_db more at the top), but T2's taps carry the tail on the first pass
+ * for seconds, and with flat taps the highs rang as long as the mids up to
+ * Size ~0.7 whatever Tone said. So T2's taps are split by age into
+ * T2_ABS_SEGS segments, and a segment's taps are cut by its age (its middle)
+ * times t2_abs_db_s: the first pass darkens at the loop's pace and the
+ * repeats carry it on. Tone sets the pace through reverb_t60_hi_ratio. The
+ * shelves nest: each segment's taps go through its own shelf and then every
+ * earlier segment's, and each shelf cuts only the step from the segment
+ * before, so the cut builds up from small shelves as the loop's passes build
+ * it, with their shape, and leaves the mids to decay at the loop's rate. The
+ * cut steps once a segment; the segments are shortest early, where the highs
+ * are still heard, no longer there than a pass of the shorter loop. */
+#define T2_ABS_SEGS      12
+#define T2_ABS_FLOOR_DB  (-60.0f)
+static const float t2_abs_edge_s[T2_ABS_SEGS] = {   /* where each segment starts */
+    0.0f, 0.06f, 0.13f, 0.21f, 0.31f, 0.43f, 0.58f, 0.77f, 1.0f, 1.33f, 1.8f, 2.6f
+};
+_Static_assert(MAX_T2_TAPS <= 255, "t2_seg_start holds tap indices in bytes");
+/* Each segment's first tap, for the gains now and for the ramp's old gains. */
+static uint8_t t2_seg_start[T2_ABS_SEGS + 1], t2_seg_start_prev[T2_ABS_SEGS + 1];
+static Biquad t2_abs_l[T2_ABS_SEGS], t2_abs_r[T2_ABS_SEGS];
+static float t2_abs_db_s_morph, t2_abs_hz_designed, t2_abs_db_s_designed;
+static float t2_out_l[REVERB_BLOCK] CCM_ATTR, t2_out_r[REVERB_BLOCK] CCM_ATTR;
+
+/* The first tap at or past each segment's start (the offsets ascend). */
+static void t2_abs_partition(const uint32_t *off, int count, uint8_t *start)
+{
+    int t = 0;
+    for (int k = 0; k < T2_ABS_SEGS; k++) {
+        const uint32_t edge = (uint32_t)(t2_abs_edge_s[k] * (float)REVERB_FS_HZ);
+        while (t < count && off[t] < edge) t++;
+        start[k] = (uint8_t)t;
+    }
+    start[T2_ABS_SEGS] = (uint8_t)count;
 }
 
 /* ==== Tap generation ==== */
@@ -2091,7 +2130,7 @@ void velvet_reverb_init(void)
     memset(t2_ring_r, 0, T2_RING_SAMPLES * sizeof(int16_t));
 
     for (int i = 0; i < REVERB_BLOCK; i++) {
-        accT0[i] = 0; accT1[i] = 0; accL[i] = 0; accR[i] = 0;
+        accT0[i] = 0; accT1[i] = 0;
         accT0_r[i] = 0; accT1_r[i] = 0;
     }
     for (int b = 0; b < REVERB_IN_NBUF; b++)
@@ -2180,6 +2219,13 @@ void velvet_reverb_init(void)
     last_fb_ls_hz = reverb_fb_low_shelf_hz;  last_fb_ls_db = reverb_fb_low_shelf_db;
     last_fb_hs_hz = reverb_fb_high_shelf_hz; last_fb_hs_db = reverb_fb_high_shelf_db;
     fb_hs_hz_morph = reverb_fb_high_shelf_hz;
+    for (int k = 0; k < T2_ABS_SEGS; k++) {
+        t2_abs_l[k].z1 = t2_abs_l[k].z2 = t2_abs_r[k].z1 = t2_abs_r[k].z2 = 0.0f;
+    }
+    memset(t2_seg_start, 0, sizeof t2_seg_start);
+    memset(t2_seg_start_prev, 0, sizeof t2_seg_start_prev);
+    t2_abs_db_s_morph = t2_abs_db_s;
+    t2_abs_hz_designed = -1.0f;   /* designed at the first block */
     pre_hp_coeff   = 1.0f - expf(-TWO_PI_F * PRE_HP_FREQ_HZ / (float)REVERB_FS_HZ);
     duck_atk_coeff = 1.0f - expf(-1.0f / (DUCK_ATK_SEC * (float)REVERB_FS_HZ));
     t0_tap_mod_phase = 0.0f;
@@ -2200,7 +2246,6 @@ void velvet_reverb_init(void)
     t1_window_morph = reverb_t1_window_ms_target * (float)REVERB_FS_HZ / 1000.0f;
     t2_window_morph = reverb_t2_duration_s_target * (float)REVERB_FS_HZ;
     t2_fade_morph = reverb_t2_fade_s_target * (float)REVERB_FS_HZ;
-    t2_fade_late_morph = reverb_t2_fade_late_s_target * (float)REVERB_FS_HZ;
     t0_tap_comp_morph = 1.0f;
     t1_tap_comp_morph = 1.0f;
     t2_tap_comp_morph = 1.0f;
@@ -2566,7 +2611,6 @@ static int32_t t0_ramp_left = 0, t1_ramp_left = 0, t2_ramp_left = 0;   /* sample
 /* The ramping stages' second outputs, from the old gains. */
 static int32_t accT0_p[REVERB_BLOCK] CCM_ATTR, accT0_r_p[REVERB_BLOCK] CCM_ATTR;
 static int32_t accT1_p[REVERB_BLOCK] CCM_ATTR, accT1_r_p[REVERB_BLOCK] CCM_ATTR;
-static int32_t accL_p[REVERB_BLOCK] CCM_ATTR, accR_p[REVERB_BLOCK] CCM_ATTR;
 
 /* How far through its ramp a stage is at sample n of this block, 0..1. */
 static inline float ramp_frac(int32_t left, int n)
@@ -2598,6 +2642,26 @@ static inline float density_comp(float full, float thinned)
 }
 
 #define T0_TAPER_FRAC  0.15f
+/* The early stages' decay, in dB a second, at every Size.
+ *
+ * The cascade is a series: each T0 tap starts a copy of T1's pattern and each
+ * T1 tap a copy of T2's, so flat early stages pile the copies up. With T0
+ * flat over its 200 ms and T1 over its 660 ms (Size's top half) the tail rose
+ * ~5 dB for the first 0.3-0.6 s before it began to fall: a swell, not a room.
+ * Fading both fast brings their energy to the front, so the tail builds over
+ * a few tens of ms and then decays at T2's rate. The windows keep their
+ * lengths, so the taps per second and their spacing are unchanged. */
+#define T0_DECAY_DB_S   120.0f
+#define T1_DECAY_DB_S   150.0f
+
+/* The depth in dB a stage's envelope reaches at the end of a window of this
+ * many samples, at most the 80 dB exp_env_lut spans. */
+static float early_env_depth_db(float window, float db_per_s)
+{
+    const float d = db_per_s * window * (1.0f / (float)REVERB_FS_HZ);
+    return d < 80.0f ? d : 80.0f;
+}
+
 static void recompute_eff_gains_t0(void)
 {
     memcpy(effGains_t0_prev, effGains_t0, sizeof effGains_t0_prev);
@@ -2614,15 +2678,17 @@ static void recompute_eff_gains_t0(void)
     compute_tap_states_mono(t0TapLadder, t0TapLadderCount, count, window, fade,
                             effOffT0, effWin);
 
-    /* T0 has no decay envelope, only a cosine taper over the last
-     * T0_TAPER_FRAC of the window, which moves with it. */
+    /* T0 decays (T0_DECAY_DB_S) and has a cosine taper over the last
+     * T0_TAPER_FRAC of the window, which moves with it. The level comp below
+     * works from the energy with both, so neither makes T0 quieter. */
     float pre[MAX_T0_TAPS];
     float energy = 0.0f, thinEnergy = 0.0f;
     const float taperStart = window * (1.0f - T0_TAPER_FRAC);
     const float invTaper = 1.0f / (window * T0_TAPER_FRAC);
+    const float envScale = early_env_depth_db(window, T0_DECAY_DB_S) * (1.0f / 80.0f) / window;
     for (int t = 0; t < count; t++) {
-        float g = (float)t0TapGains[t] * effWin[t];
         const float off = (float)effOffT0[t];
+        float g = (float)t0TapGains[t] * effWin[t] * exp_decay_from_frac(off * envScale);
         if (off > taperStart) {
             float x = (window - off) * invTaper;
             if (x < 0.0f) x = 0.0f;
@@ -2645,32 +2711,6 @@ static void recompute_eff_gains_t0(void)
 
     t0_makeup = stage_fit(pre, count, t0_tap_comp_morph);
     for (int t = 0; t < count; t++) effGains_t0[t] = clamp_f_to_int16(pre[t]);
-}
-
-/* T1's decay envelope, for small Sizes.
- *
- * T1 is the middle of the T0 -> T1 -> T2 cascade, and with flat taps a T1
- * window of a few hundred ms is longer than a short T2 fade itself:
- * convolved with T2 it holds the tail near its peak for a couple of hundred ms
- * and then lets T2's decay take over, a gated shape heard as a late swell and a
- * tail that cuts off (at Decay 0.35 the energy peaked at 240 ms, and the early
- * decay ran at half the rate of the late). Fading T1's taps across its window
- * brings the energy forward while the window stays long enough to keep T2's
- * copies overlapping.
- *
- * Full depth up to T1_ENV_FULL_MS of window, none from T1_ENV_NONE_MS (just
- * above the default Size's 536 ms), so the large settings keep their bloom; in
- * between the depth follows the window, and so glides with the knob. */
-#define T1_ENV_DB        30.0f
-#define T1_ENV_FULL_MS  250.0f
-#define T1_ENV_NONE_MS  560.0f
-
-static float t1_env_depth_db(float window)
-{
-    const float w_ms = window * (1000.0f / (float)REVERB_FS_HZ);
-    float x = (T1_ENV_NONE_MS - w_ms) * (1.0f / (T1_ENV_NONE_MS - T1_ENV_FULL_MS));
-    if (x < 0.0f) x = 0.0f; else if (x > 1.0f) x = 1.0f;
-    return T1_ENV_DB * x;
 }
 
 static void recompute_eff_gains_t1(void)
@@ -2708,9 +2748,9 @@ static void recompute_eff_gains_t1(void)
     t1_comp_goal = comp;
     t1_tap_comp_morph += ALPHA_WINDOW_MORPH * (comp - t1_tap_comp_morph);
 
-    /* Short-decay envelope (see T1_ENV_DB), rescaled so T1 keeps the energy it
+    /* T1's decay (see T1_DECAY_DB_S), rescaled so T1 keeps the energy it
      * would have without it: it reshapes T1, it does not make it quieter. */
-    const float depth = t1_env_depth_db(window);
+    const float depth = early_env_depth_db(window, T1_DECAY_DB_S);
     if (depth > 0.0f) {
         const float invLen = 1.0f / window;
         const float span = depth * (1.0f / 80.0f);      /* exp_env_lut spans 80 dB */
@@ -2756,15 +2796,14 @@ static void recompute_eff_gains_t2(void)
     float fade = window * FADE_WINDOW_FRAC;
     if (fade < T2_FADE_MIN) fade = T2_FADE_MIN;
     float invWindow = (window > 1e-6f) ? 1.0f / window : 0.0f;
-    /* The taps fall 80 dB over the fade length, slowly for SIZE_HIDE_S and
-     * then at the late rate (see SIZE_TAPS_U). */
+    /* The taps fall 80 dB over the fade length (see SIZE_TAPS_U). */
     const float invFade = (t2_fade_morph > 1e-6f) ? 1.0f / t2_fade_morph : 0.0f;
-    const float invFadeLate = (t2_fade_late_morph > 1e-6f) ? 1.0f / t2_fade_late_morph : 0.0f;
-    const float knee = SIZE_HIDE_S * (float)REVERB_FS_HZ;
 
     float effWin[MAX_T2_TAPS];
     compute_tap_states_lr(t2TapLadderL, t2TapLadderR, t2TapLadderCount, count,
                           window, fade, effOffT2L, effOffT2R, effWin);
+    memcpy(t2_seg_start_prev, t2_seg_start, sizeof t2_seg_start_prev);
+    t2_abs_partition(effOffT2L, count, t2_seg_start);
 
     /* refEnergy is the stage's energy with the fade spanning the window: the
      * level compensation works from it, and the taps are scaled to keep it, so
@@ -2778,8 +2817,7 @@ static void recompute_eff_gains_t2(void)
         const float off = (float)effOffT2L[t];
         const float base = (float)t2TapGains[t] * effWin[t];
         const float r = base * exp_decay_from_frac(off * invWindow);
-        float g = base * exp_decay_from_frac(off < knee ? off * invFade
-                                             : knee * invFade + (off - knee) * invFadeLate);
+        float g = base * exp_decay_from_frac(off * invFade);
         refEnergy += r * r;
         energy += g * g;
         pre[t] = g;
@@ -2867,7 +2905,6 @@ static void update_morph_state(void)
     t1_window_morph += ALPHA_WINDOW_MORPH * (t1_win_target - t1_window_morph);
     t2_window_morph += ALPHA_WINDOW_MORPH * (t2_win_target - t2_window_morph);
     t2_fade_morph += ALPHA_WINDOW_MORPH * (reverb_t2_fade_s_target * (float)REVERB_FS_HZ - t2_fade_morph);
-    t2_fade_late_morph += ALPHA_WINDOW_MORPH * (reverb_t2_fade_late_s_target * (float)REVERB_FS_HZ - t2_fade_late_morph);
 
     /* The loop lengths. They are not glided: a moving delay in the feedback
      * loop re-pitches the whole tail. do_predelay steps to them (see PdLen).
@@ -2923,7 +2960,7 @@ static void update_morph_state(void)
 #define DB_DURATION_SAMPLES (DB_DURATION_TARGET * (float)REVERB_FS_HZ)            /* 240 */
 
 static float last_t0_win_target = -1e9f, last_t1_win_target = -1e9f, last_t2_dur_target = -1e9f;
-static float last_t2_fade_target = -1e9f, last_t2_fade_late_target = -1e9f;
+static float last_t2_fade_target = -1e9f;
 static float last_t0_cnt_target = -1e9f, last_t1_cnt_target = -1e9f, last_t2_cnt_target = -1e9f;
 static uint16_t effgains_settle_counter = 0;
 static uint16_t effgains_periodic_counter = 0;
@@ -2956,9 +2993,6 @@ static void background_eff_gains_update(void)
     }
     if (fabsf(reverb_t2_fade_s_target - last_t2_fade_target) > DB_DURATION_TARGET) {
         last_t2_fade_target = reverb_t2_fade_s_target; changed = 1;
-    }
-    if (fabsf(reverb_t2_fade_late_s_target - last_t2_fade_late_target) > DB_DURATION_TARGET) {
-        last_t2_fade_late_target = reverb_t2_fade_late_s_target; changed = 1;
     }
 
     /* Size moves each stage's energy a long way, so the level comps must
@@ -3013,7 +3047,6 @@ static void background_eff_gains_update(void)
                 fabsf(t1w - t1_window_morph) < DB_WINDOW_SAMPLES &&
                 fabsf(t2w - t2_window_morph) < DB_DURATION_SAMPLES &&
                 fabsf(reverb_t2_fade_s_target * (float)REVERB_FS_HZ - t2_fade_morph) < DB_DURATION_SAMPLES &&
-                fabsf(reverb_t2_fade_late_s_target * (float)REVERB_FS_HZ - t2_fade_late_morph) < DB_DURATION_SAMPLES &&
                 fabsf(reverb_t0_count_target - t0_count_morph) < DB_COUNT_TARGET &&
                 fabsf(reverb_t1_count_target - t1_count_morph) < DB_COUNT_TARGET &&
                 fabsf(reverb_t2_count_target - t2_count_morph) < DB_COUNT_TARGET;
@@ -4564,15 +4597,44 @@ static void do_bridge_t1_to_t2(void)
         packed = ((uint32_t)(uint16_t)r1 << 16) | (uint32_t)(uint16_t)r0;
         *((volatile u32_alias *)&t2_ring_r[wi & T2_RING_MASK]) = packed;
     }
-    for (int i = 0; i < REVERB_BLOCK; i++) { accL[i] = 0; accR[i] = 0; }
 }
 
+/* The segments' shelves, designed again when the rate or the corner has moved
+ * a hair (as the loop's are): each cuts the step from the segment before (see
+ * T2_ABS_SEGS). The rate glides as the loop's feedback does. */
+static void t2_abs_design(void)
+{
+    t2_abs_db_s_morph += 0.01f * (t2_abs_db_s - t2_abs_db_s_morph);
+    const float hz = fb_hs_hz_morph, rate = t2_abs_db_s_morph;
+    if (fabsf(hz - t2_abs_hz_designed) <= t2_abs_hz_designed * 0.0003f &&
+        fabsf(rate - t2_abs_db_s_designed) <= 0.002f * (1.0f + rate)) return;
+    t2_abs_hz_designed = hz;
+    t2_abs_db_s_designed = rate;
+    const float w0 = TWO_PI_F * hz / (float)REVERB_FS_HZ;
+    const float cosw = cosf(w0), alpha = sinf(w0) * 0.5f * 1.41421356f;
+    float before = 0.0f;
+    for (int k = 0; k < T2_ABS_SEGS; k++) {
+        const float end = k + 1 < T2_ABS_SEGS ? t2_abs_edge_s[k + 1] : T2_SPAN_MAX_S;
+        float db = -rate * 0.5f * (t2_abs_edge_s[k] + end);
+        if (db < T2_ABS_FLOOR_DB) db = T2_ABS_FLOOR_DB;
+        biquad_highshelf_cs(&t2_abs_l[k], cosw, alpha, db - before);
+        before = db;
+        biquad_copy_coeffs(&t2_abs_r[k], &t2_abs_l[k]);
+    }
+}
+
+/* T2 into t2_out_l/r, at full scale 1.0: from the last segment to the first,
+ * each segment's taps (crossfaded while the gains ramp, the old gains with the
+ * old segments) join what the later segments made, and the sum goes through
+ * the segment's shelf. A segment with no taps still runs its shelf, so what
+ * passes through it rings out. */
 static void do_t2_phase(void)
 {
     const int count = t2_active;
+    int h = 0;
     if (count > 0) {
         t2_gather_wait();                        /* a chain still in flight lands first */
-        int h = t2_gather_find(block_write_idx);
+        h = t2_gather_find(block_write_idx);
 #ifdef VELVET_REVERB_HOST
         if (h < 0) host_dbg_t2_gather_late++;
         else if (h == 0) host_dbg_t2_gather_early++;
@@ -4582,13 +4644,42 @@ static void do_t2_phase(void)
 #if defined(DIAG_REVERB_PROFILE) && !defined(VELVET_REVERB_HOST)
         prof_t2_h = h; prof_t2_bw = block_write_idx;
 #endif
-        t2_conv_blocked(&t2_gather[0][h],           accL, count, effGains_t2);
-        t2_conv_blocked(&t2_gather[MAX_T2_TAPS][h], accR, count, T2_GAINS_R);
-        if (t2_ramp_left > 0) {
-            for (int i = 0; i < REVERB_BLOCK; i++) accL_p[i] = accR_p[i] = 0;
-            t2_conv_blocked(&t2_gather[0][h],           accL_p, count, effGains_t2_prev);
-            t2_conv_blocked(&t2_gather[MAX_T2_TAPS][h], accR_p, count, effGains_t2R_prev);
+    }
+    t2_abs_design();
+    const int ramp = t2_ramp_left > 0;
+    const float mkL = t2_makeup_l * (1.0f / 1073741824.0f), mkR = t2_makeup_r * (1.0f / 1073741824.0f);
+    for (int i = 0; i < REVERB_BLOCK; i++) t2_out_l[i] = t2_out_r[i] = 0.0f;
+    for (int k = T2_ABS_SEGS - 1; k >= 0; k--) {
+        int32_t aL[REVERB_BLOCK], aR[REVERB_BLOCK], pL[REVERB_BLOCK], pR[REVERB_BLOCK];
+        for (int i = 0; i < REVERB_BLOCK; i++) aL[i] = aR[i] = 0;
+        int a = t2_seg_start[k], b = t2_seg_start[k + 1];
+        if (b > count) b = count;
+        if (b > a) {
+            t2_conv_blocked(&t2_gather[a][h],               aL, b - a, effGains_t2 + a);
+            t2_conv_blocked(&t2_gather[MAX_T2_TAPS + a][h], aR, b - a, T2_GAINS_R + a);
         }
+        Biquad fl = t2_abs_l[k], fr = t2_abs_r[k];
+        if (ramp) {
+            for (int i = 0; i < REVERB_BLOCK; i++) pL[i] = pR[i] = 0;
+            a = t2_seg_start_prev[k]; b = t2_seg_start_prev[k + 1];
+            if (b > count) b = count;
+            if (b > a) {
+                t2_conv_blocked(&t2_gather[a][h],               pL, b - a, effGains_t2_prev + a);
+                t2_conv_blocked(&t2_gather[MAX_T2_TAPS + a][h], pR, b - a, effGains_t2R_prev + a);
+            }
+            for (int i = 0; i < REVERB_BLOCK; i++) {
+                const float f = ramp_frac(t2_ramp_left, i);
+                t2_out_l[i] = biquad_process(&fl, t2_out_l[i] + acc_blend(pL[i], t2_makeup_l_prev, aL[i], t2_makeup_l, f));
+                t2_out_r[i] = biquad_process(&fr, t2_out_r[i] + acc_blend(pR[i], t2_makeup_r_prev, aR[i], t2_makeup_r, f));
+            }
+        } else {
+            for (int i = 0; i < REVERB_BLOCK; i++) {
+                t2_out_l[i] = biquad_process(&fl, t2_out_l[i] + (float)aL[i] * mkL);
+                t2_out_r[i] = biquad_process(&fr, t2_out_r[i] + (float)aR[i] * mkR);
+            }
+        }
+        t2_abs_l[k].z1 = fl.z1; t2_abs_l[k].z2 = fl.z2;
+        t2_abs_r[k].z1 = fr.z1; t2_abs_r[k].z2 = fr.z2;
     }
 }
 
@@ -4648,14 +4739,8 @@ static void do_finalize(void)
      * path, writing straight through with no look-ahead buffer, peak scan or gain. */
     for (int i = 0; i < REVERB_BLOCK; i++) {
         float rawL, rawR;
-        if (t2_ramp_left > 0) {
-            const float f = ramp_frac(t2_ramp_left, i);
-            rawL = soft_clip_unit(acc_blend(accL_p[i], t2_makeup_l_prev, accL[i], t2_makeup_l, f)) * (REVERB_OUT_MAKEUP * 32767.0f);
-            rawR = soft_clip_unit(acc_blend(accR_p[i], t2_makeup_r_prev, accR[i], t2_makeup_r, f)) * (REVERB_OUT_MAKEUP * 32767.0f);
-        } else {
-            rawL = soft_clip_unit((float)accL[i] * (t2_makeup_l * (1.0f / 1073741824.0f))) * (REVERB_OUT_MAKEUP * 32767.0f);
-            rawR = soft_clip_unit((float)accR[i] * (t2_makeup_r * (1.0f / 1073741824.0f))) * (REVERB_OUT_MAKEUP * 32767.0f);
-        }
+        rawL = soft_clip_unit(t2_out_l[i]) * (REVERB_OUT_MAKEUP * 32767.0f);
+        rawR = soft_clip_unit(t2_out_r[i]) * (REVERB_OUT_MAKEUP * 32767.0f);
         float m = 0.5f * (rawL + rawR);
         float s = 0.5f * (rawL - rawR) * REVERB_STEREO_WIDTH;
         float curL = m + s;
@@ -4688,21 +4773,12 @@ static void do_finalize(void)
          * REVERB_HEADROOM). soft_saturate_q15 soft-clips the cooled accumulator
          * at full scale first, so the makeup can't reintroduce a hard over. */
 #ifdef VELVET_REVERB_HOST
-        host_note_sat(accL[i], &host_dbg_out_peak, &host_dbg_out_sat);
-        host_note_sat(accR[i], &host_dbg_out_peak, &host_dbg_out_sat);
+        host_note_level(t2_out_l[i], &host_dbg_out_peak, &host_dbg_out_sat);
+        host_note_level(t2_out_r[i], &host_dbg_out_peak, &host_dbg_out_sat);
 #endif
         float rawL, rawR;
-        if (t2_ramp_left > 0) {
-            const float f = ramp_frac(t2_ramp_left, i);
-            rawL = soft_clip_unit(acc_blend(accL_p[i], t2_makeup_l_prev, accL[i], t2_makeup_l, f)) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
-            rawR = soft_clip_unit(acc_blend(accR_p[i], t2_makeup_r_prev, accR[i], t2_makeup_r, f)) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
-        } else {
-            /* In float, made up before the output is quantised: rounding it to
-             * int16 first and then making it up (x4, then the wet gain)
-             * left the output with ~13 bits. */
-            rawL = soft_clip_unit((float)accL[i] * (t2_makeup_l * (1.0f / 1073741824.0f))) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
-            rawR = soft_clip_unit((float)accR[i] * (t2_makeup_r * (1.0f / 1073741824.0f))) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
-        }
+        rawL = soft_clip_unit(t2_out_l[i]) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
+        rawR = soft_clip_unit(t2_out_r[i]) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
         float m = 0.5f * (rawL + rawR);
         float s = 0.5f * (rawL - rawR) * REVERB_STEREO_WIDTH;
         float curL = m + s;
