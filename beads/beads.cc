@@ -27,9 +27,11 @@
 //                       fully clockwise. Over the bottom quarter the sustain
 //                       loop's echoes thin to a single train that repeats
 //                       only itself.
-//   DRY/WET knob        Reverb send (equal power; the wet output is at the
-//                       DLD's level, REVERB_OUT_GAIN). The top 10% fades the dry
-//                       signal out, so the knob's end is 100% reverb.
+//   DRY/WET knob        The output mix, after the reverb: an equal-power
+//                       crossfade from all dry (fully counter-clockwise) to all
+//                       reverb (fully clockwise), both -3 dB at noon. The
+//                       reverb always takes the input at full level, so the
+//                       knob moves the balance at once, tails included.
 //   PITCH knob          Pitch shift of the reverb feed, on Beads' own detented
 //                       interval law (0, 1, 3, 4, 7, 12 semitones either way),
 //                       + the PITCH CV input, 1 V/oct with its attenuverter
@@ -165,8 +167,8 @@ volatile float fx_amount[kFxSlots] = { MOD_AMOUNT_DEFAULT, 0.0f, 0.0f, 0.0f };
 volatile uint32_t fx_select_seq = 0;
 
 // Written by the main loop, read by the audio callback.
-volatile float send_gain = 0.7f;
-volatile float dry_gain = 1.0f;
+volatile float dry_gain = 0.70710678f;
+volatile float wet_gain = 0.70710678f;
 
 extern "C" {
 
@@ -408,8 +410,11 @@ void Process(
   const bool mute = startup_mute_blocks > 0;
   if (mute) --startup_mute_blocks;
 
-  const float send = send_gain;
-  const float dry = dry_gain;
+  // The mix glides across the block from where the last one left it, so a
+  // turn of the knob never steps the output.
+  static float dry_from = 0.70710678f, wet_from = 0.70710678f;
+  const float dry_to = dry_gain, wet_to = wet_gain;
+  const float glide = 1.0f / static_cast<float>(size);
   float peak = input_peak;
 
   for (size_t i = 0; i < size; ++i) {
@@ -428,27 +433,34 @@ void Process(
 
     // Stereo in: each side feeds its own side of the reverb (a lone patched
     // input has already been copied to both).
-    velvet_reverb_push_stereo(SaturateInt16(l * send * 32768.0f),
-                              SaturateInt16(r * send * 32768.0f));
-    float out_l = OutputKnee(l * dry + velvet_reverb_out_left() * (1.0f / 32768.0f));
-    float out_r = OutputKnee(r * dry + velvet_reverb_out_right() * (1.0f / 32768.0f));
+    velvet_reverb_push_stereo(SaturateInt16(l * 32768.0f),
+                              SaturateInt16(r * 32768.0f));
+    const float g = static_cast<float>(i + 1) * glide;
+    const float dry = dry_from + g * (dry_to - dry_from);
+    const float wet = (wet_from + g * (wet_to - wet_from)) * (1.0f / 32768.0f);
+    float out_l = OutputKnee(l * dry + velvet_reverb_out_left() * wet);
+    float out_r = OutputKnee(r * dry + velvet_reverb_out_right() * wet);
     CONSTRAIN(out_l, -1.0f, 0.999999f);
     CONSTRAIN(out_r, -1.0f, 0.999999f);
     out[i].l = static_cast<int32_t>(out_l * 2147483648.0f);
     out[i].r = static_cast<int32_t>(out_r * 2147483648.0f);
   }
+  dry_from = dry_to;
+  wet_from = wet_to;
   input_peak = peak;
   audio_cycles += DWT->CYCCNT - process_start;
 }
 
-// DRY/WET pot -> send and dry gain, as on the DLD's right MIX pot: the send
-// follows an equal-power curve, and the last 10% of travel fades the dry path
-// out so the end of the knob is 100% reverb.
+// DRY/WET pot -> the output mix: an equal-power crossfade, dry on the cosine
+// and reverb on the sine. kMixEnd of travel at each end is a dead zone, so
+// the ends are exactly all dry and all reverb.
+const float kMixEnd = 0.02f;
+
 void UpdateMix() {
-  const float t = cv_reader.pot(POTS_ADC_CHANNEL_DRY_WET);
-  send_gain = sinf(std::min(std::max(t, 0.0f), 1.0f) * 1.5707963f);
-  const float fade_start = 0.9f;
-  dry_gain = t <= fade_start ? 1.0f : std::max(0.0f, (1.0f - t) / (1.0f - fade_start));
+  float t = (cv_reader.pot(POTS_ADC_CHANNEL_DRY_WET) - kMixEnd) / (1.0f - 2.0f * kMixEnd);
+  t = std::min(std::max(t, 0.0f), 1.0f);
+  dry_gain = t >= 1.0f ? 0.0f : cosf(t * 1.5707963f);
+  wet_gain = sinf(t * 1.5707963f);
 }
 
 void Init() {
