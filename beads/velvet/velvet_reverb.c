@@ -551,22 +551,43 @@ uint32_t host_dbg_t2_gather_late  = 0;
  * > 0). Density and Size then reshape theirs (velvet_reverb_recompute_macros):
  * Size sets the stage windows, which set both the tap spacing and the T1/T2
  * tap fades, T2's fade and the sustain loop's feedback (see SIZE_TAPS_U). */
-/* Density: tap count per stage, from DENSITY_Tx_MIN to the full MAX_Tx_TAPS.
- * Turning down from the top, the stages thin one after another: T0 over the
- * top third of the knob, then T1 over the middle third, then T2 over the
- * bottom third, each exponentially in its own third. So the early taps go
- * first, then the middle stage's, and the long last stage, which carries the
- * tail, thins last. The cascade is serial, so a stage needs one tap or the
- * reverb goes silent; at one tap in every stage the cascade is a single
- * path, and what is left is the sustain engine's loops (echoes, not a
- * wash). Counts are fractional: the tap at the boundary is part-faded. */
+/* Density, in two halves. Turning down from the top, the start of the tail
+ * thins first: over the top half (down to DENSITY_BUILD_U) the tail begins as
+ * a few separate echoes and fills in to full density over a build-up that
+ * lengthens as the knob turns down. The cascade is serial (each echo is a
+ * copy of T0's pattern through each of T1's taps through each of T2's), so
+ * the start is sparse only if every stage is: T1's and T2's earliest taps
+ * thin out (DENSITY_BUILD_MIN, DENSITY_BUILD_T1/T2), and T0 thins to
+ * DENSITY_T0_HALF, so that each echo is crisp enough to be heard as one
+ * rather than as a smear. Over the bottom half the whole tail thins: the tap
+ * count per stage falls to DENSITY_Tx_MIN, the stages one after another, T0
+ * over the top third of that half, then T1, then T2, each exponentially in
+ * its own third, so the long last stage, which carries the tail, thins last.
+ * The cascade needs one tap a stage or the reverb goes silent; at one tap in
+ * every stage it is a single path, and what is left is the sustain engine's
+ * loops (echoes, not a wash). Counts are fractional: the tap at the boundary
+ * is part-faded. */
+#define DENSITY_BUILD_U  0.5f
+/* The build-up at its longest (DENSITY_BUILD_U and below): T1's and T2's taps
+ * start at DENSITY_BUILD_MIN of their density and reach all of them over the
+ * first DENSITY_BUILD_T1/T2 of their windows (so a bigger space builds up
+ * longer: T2's at full Size over its first 2 s), on a smoothstep. Above
+ * DENSITY_BUILD_U both shrink, the start's density exponentially, to none at
+ * the top. The taps kept early are the ones Density keeps longest (their
+ * ranks, so they stay evenly spread), each made louder by the density it
+ * stands in for, so the tail's level holds while its texture fills in. */
+#define DENSITY_BUILD_MIN  0.03f
+#define DENSITY_BUILD_T1   0.6f
+#define DENSITY_BUILD_T2   0.375f
+#define DENSITY_T0_HALF    ((float)MAX_T0_TAPS / 40.0f)   /* T0's taps at DENSITY_BUILD_U */
+float reverb_density_build_target = 0.0f;   /* 0 none .. 1 longest, driven by Density */
 /* The fewest taps Density keeps: one in every stage, so at the bottom of the
  * knob the cascade is a single path and each of the loop's echoes comes out
  * once (LOOP_JITTER_MAX keeps those echoes from falling into a rhythm). */
 #define DENSITY_T0_MIN  1.0f
 #define DENSITY_T1_MIN  1.0f
 #define DENSITY_T2_MIN  1.0f
-#define DENSITY_THIN_U  0.25f     /* the bottom of the knob that thins the loop (see loop_thin_target) */
+#define DENSITY_THIN_U  0.125f    /* the bottom of the knob that thins the loop (see loop_thin_target) */
 float reverb_t0_count_target = (float)MAX_T0_TAPS;   /* driven by Density */
 float reverb_t1_count_target = (float)MAX_T1_TAPS;
 float reverb_t2_count_target = (float)MAX_T2_TAPS;
@@ -688,17 +709,24 @@ void velvet_reverb_recompute_macros(void)
             *mp->target = val;
         }
     }
-    /* Density's stages, one after another (see DENSITY_T0_MIN). */
+    /* Density: the build-up over the top half, the stages one after another
+     * over the bottom half (see DENSITY_BUILD_U). */
     {
         float v = reverb_macros[MACRO_DENSITY].value;
         if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
+        float y = (1.0f - v) * (1.0f / (1.0f - DENSITY_BUILD_U));
+        reverb_density_build_target = y > 1.0f ? 1.0f : y;
         static const macro_param_id_t ids[3] = { MP_T2_COUNT, MP_T1_COUNT, MP_T0_COUNT };
         for (int k = 0; k < 3; k++) {
-            /* Stage ids[k] thins over the k-th third from the bottom. */
-            float x = v * 3.0f - (float)k;
+            /* Stage ids[k] thins over the k-th third of the bottom half; T0
+             * from DENSITY_T0_HALF, having thinned to it over the top half. */
+            float x = v * (3.0f / DENSITY_BUILD_U) - (float)k;
             if (x < 0.0f) x = 0.0f; else if (x > 1.0f) x = 1.0f;
             const macro_param_t *mp = &reverb_macro_params[ids[k]];
-            *mp->target = mp->bound_min * powf(mp->bound_max / mp->bound_min, x);
+            const float top = (k == 2) ? DENSITY_T0_HALF : mp->bound_max;
+            *mp->target = mp->bound_min * powf(top / mp->bound_min, x);
+            if (k == 2 && v > DENSITY_BUILD_U)
+                *mp->target = mp->bound_max * powf(DENSITY_T0_HALF / mp->bound_max, reverb_density_build_target);
         }
     }
     /* Size: first the taps, then the loop. */
@@ -874,6 +902,7 @@ static float t0_window_morph;       /* samples at fs_reverb */
 static float t1_window_morph;
 static float t2_window_morph;
 static float t2_fade_morph;         /* samples (Size) */
+static float density_build_morph;        /* 0..1 (Density, see DENSITY_BUILD_U) */
 static float t0_tap_comp_morph;
 static float t1_tap_comp_morph;
 static float t2_tap_comp_morph;
@@ -1817,6 +1846,49 @@ static inline float density_fade(float rank, float count_morph)
     return x * x * (3.0f - 2.0f * x);
 }
 
+/* The build-up (DENSITY_BUILD_U) on one stage's taps (pre[], at offsets
+ * off[], in time order): until buildLen samples the share of taps kept rises
+ * from rho0 to all of them, the lowest ranks kept. Each kept tap is made
+ * louder by the share actually kept around it (energy-weighted, over
+ * BUILD_NEIGHBOURS taps either side), so the stage's energy envelope holds
+ * while its texture thins, and the stage is then rescaled to the energy it
+ * had. */
+#define BUILD_NEIGHBOURS 6
+static void density_build(float *pre, const uint32_t *off, const float *ranks, int n,
+                          float buildLen, float rho0)
+{
+    if (buildLen <= 1.0f || n <= 0) return;
+    float f[MAX_T2_TAPS > MAX_T1_TAPS ? MAX_T2_TAPS : MAX_T1_TAPS], g2[MAX_T2_TAPS > MAX_T1_TAPS ? MAX_T2_TAPS : MAX_T1_TAPS];
+    int last = -1;
+    for (int t = 0; t < n; t++) {
+        g2[t] = pre[t] * pre[t];
+        f[t] = 1.0f;
+        if ((float)off[t] < buildLen) {
+            const float x = (float)off[t] / buildLen;
+            const float rho = rho0 + (1.0f - rho0) * x * x * (3.0f - 2.0f * x);
+            f[t] = density_fade(ranks[t], rho * (float)n);
+            last = t;
+        }
+    }
+    if (last < 0) return;
+    float before = 0.0f, after = 0.0f;
+    for (int t = 0; t < n; t++) before += g2[t];
+    for (int t = 0; t <= last + BUILD_NEIGHBOURS && t < n; t++) {
+        if (f[t] == 0.0f) { pre[t] = 0.0f; continue; }
+        float kept = 0.0f, all = 0.0f;
+        const int a = t - BUILD_NEIGHBOURS < 0 ? 0 : t - BUILD_NEIGHBOURS;
+        const int b = t + BUILD_NEIGHBOURS >= n ? n - 1 : t + BUILD_NEIGHBOURS;
+        for (int j = a; j <= b; j++) { kept += f[j] * f[j] * g2[j]; all += g2[j]; }
+        const float share = all > 0.0f ? kept / all : 1.0f;
+        pre[t] *= f[t] / sqrtf(share > 1e-3f ? share : 1e-3f);
+    }
+    for (int t = 0; t < n; t++) after += pre[t] * pre[t];
+    if (after > 1e-6f) {
+        const float k = sqrtf(before / after);
+        for (int t = 0; t < n; t++) pre[t] *= k;
+    }
+}
+
 /* Density wander, in T2 only: below its full set, the taps that sound don't
  * stay put, or the sparse long stage would repeat one fixed rhythm through
  * the whole tail (T0 and T1 just thin, in the fixed order of compute_tap_ranks,
@@ -2277,6 +2349,7 @@ void velvet_reverb_init(void)
     t0_count_morph = reverb_t0_count_target;
     t1_count_morph = reverb_t1_count_target;
     t2_count_morph = reverb_t2_count_target;
+    density_build_morph = reverb_density_build_target;
     memset(&t2_wander, 0, sizeof t2_wander);
     memset(&t2_wander_r, 0, sizeof t2_wander_r);
     t2_wander.seed = 0x51ED270Bu;
@@ -2809,6 +2882,12 @@ static void recompute_eff_gains_t1(void)
         }
     }
 
+    /* The build-up (DENSITY_BUILD_U), over the first DENSITY_BUILD_T1 of
+     * T1's window. */
+    if (density_build_morph > 0.0f)
+        density_build(pre, effOffT1, t1TapRanks, count, density_build_morph * DENSITY_BUILD_T1 * window,
+                      powf(DENSITY_BUILD_MIN, density_build_morph));
+
     /* Onset: each T1 tap adds another copy of T0's dense pattern, so with
      * flat T1 gains the tail's energy climbs ~9 dB over the first ~150 ms.
      * Weighting T1's earliest taps up (t1OnsetBoost) makes the tail start at
@@ -2866,6 +2945,11 @@ static void recompute_eff_gains_t2(void)
         energy += g * g;
         pre[t] = g;
     }
+    /* The build-up (DENSITY_BUILD_U), over the first DENSITY_BUILD_T2 of the
+     * window; it keeps T2's energy, so the comps below are unchanged. */
+    if (density_build_morph > 0.0f)
+        density_build(pre, effOffT2L, t2TapRanks, count, density_build_morph * DENSITY_BUILD_T2 * window,
+                      powf(DENSITY_BUILD_MIN, density_build_morph));
     /* T2 is the stereo stage, L and R reading at their own offsets. Thinned
      * to a few taps, a shared selection would leave the width to whichever
      * taps sound (with only the pinned first tap, L and R are the same tap:
@@ -2938,6 +3022,7 @@ static void update_morph_state(void)
     t0_count_morph += ALPHA_WINDOW_MORPH * (reverb_t0_count_target - t0_count_morph);
     t1_count_morph += ALPHA_WINDOW_MORPH * (reverb_t1_count_target - t1_count_morph);
     t2_count_morph += ALPHA_WINDOW_MORPH * (reverb_t2_count_target - t2_count_morph);
+    density_build_morph += ALPHA_WINDOW_MORPH * (reverb_density_build_target - density_build_morph);
     wander_blocks++;
     loop_thin_morph += ALPHA_WINDOW_MORPH * (loop_thin_target - loop_thin_morph);
     if (fabsf(loop_thin_target - loop_thin_morph) < 1e-5f) loop_thin_morph = loop_thin_target;
@@ -3006,6 +3091,8 @@ static void update_morph_state(void)
 static float last_t0_win_target = -1e9f, last_t1_win_target = -1e9f, last_t2_dur_target = -1e9f;
 static float last_t2_fade_target = -1e9f;
 static float last_t0_cnt_target = -1e9f, last_t1_cnt_target = -1e9f, last_t2_cnt_target = -1e9f;
+static float last_density_build_target = -1e9f;
+#define DB_BUILD_TARGET    0.002f     /* of the build-up's range */
 static uint16_t effgains_settle_counter = 0;
 static uint16_t effgains_periodic_counter = 0;
 
@@ -3025,6 +3112,9 @@ static void background_eff_gains_update(void)
     }
     if (fabsf(reverb_t2_count_target - last_t2_cnt_target) > DB_COUNT_TARGET) {
         last_t2_cnt_target = reverb_t2_count_target; changed = 1;
+    }
+    if (fabsf(reverb_density_build_target - last_density_build_target) > DB_BUILD_TARGET) {
+        last_density_build_target = reverb_density_build_target; changed = 1;
     }
     if (fabsf(reverb_t0_window_ms_target - last_t0_win_target) > DB_WINDOW_TARGET) {
         last_t0_win_target = reverb_t0_window_ms_target; changed = 1;
@@ -3093,7 +3183,8 @@ static void background_eff_gains_update(void)
                 fabsf(reverb_t2_fade_s_target * (float)REVERB_FS_HZ - t2_fade_morph) < DB_DURATION_SAMPLES &&
                 fabsf(reverb_t0_count_target - t0_count_morph) < DB_COUNT_TARGET &&
                 fabsf(reverb_t1_count_target - t1_count_morph) < DB_COUNT_TARGET &&
-                fabsf(reverb_t2_count_target - t2_count_morph) < DB_COUNT_TARGET;
+                fabsf(reverb_t2_count_target - t2_count_morph) < DB_COUNT_TARGET &&
+                fabsf(reverb_density_build_target - density_build_morph) < DB_BUILD_TARGET;
             if (!settled) effgains_settle_counter = EFFGAINS_SETTLE_BLOCKS;
 #endif
         }

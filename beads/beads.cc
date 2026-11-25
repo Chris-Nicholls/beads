@@ -22,14 +22,16 @@
 //   walk whose depth grows either side of noon, fast clockwise and slow
 //   counter-clockwise; PITCH's, clockwise, makes octave jumps instead (see
 //   OctaveJumps). Patching is sensed by Beads' normalization probe.
-//   DENSITY knob        Density macro (+ DENSITY CV): taps per reverb stage,
-//                       from one each to the full set (the DLD's sound)
-//                       fully clockwise. Over the bottom quarter the sustain
-//                       loop's echoes thin to a single train, and over the
-//                       bottom half each pass of the loop takes its own,
-//                       longer length, so the sparse echoes thin further and
-//                       never fall into a beat, and the stereo width narrows
-//                       so they don't ping-pong.
+//   DENSITY knob        Density macro (+ DENSITY CV), in two halves. Down
+//                       from fully clockwise (the full set, the DLD's sound)
+//                       the start of the tail thins first: it begins as a few
+//                       separate echoes and builds up to full density, over a
+//                       longer build-up the further it turns. Over the bottom
+//                       half the whole tail thins, to one tap per stage; the
+//                       sustain loop's echoes thin to a single train, each
+//                       pass of the loop takes its own, longer length, so the
+//                       sparse echoes never fall into a beat, and the stereo
+//                       width narrows so they don't ping-pong.
 //   DRY/WET knob        The output mix, after the reverb: an equal-power
 //                       crossfade from all dry (fully counter-clockwise) to all
 //                       reverb (fully clockwise), both -3 dB at noon. The
