@@ -69,6 +69,10 @@
 //                       reduction, amber = saturation, blue = flutter; brighter
 //                       as its amount rises
 //   VU LED              Input level
+//   ASSIGN button       Picks the small knob ASSIGN CV adds to, as on Beads:
+//                       FEEDBACK (the selected effect's amount), DRY/WET or
+//                       REVERB, in turn. The LED by that knob's badge lights.
+//   ASSIGN CV           Added to the picked knob (+-5 V across its range).
 //
 // Audio runs at 48 kHz in 12-frame blocks (4 kHz block rate). The reverb runs
 // at 24 kHz, in stereo: its input is decimated in velvet_reverb_push_stereo() and its
@@ -177,6 +181,19 @@ volatile uint32_t fx_select_seq = 0;
 volatile float dry_gain = 0.70710678f;
 volatile float wet_gain = 0.70710678f;
 
+// ASSIGN: the small knob ASSIGN CV adds to (set by the ASSIGN button), and
+// the CV as last read. The jack has no normalization probe; unpatched it
+// reads about kAssignCvOffset, which is taken off, as on Beads.
+enum AssignDestination {
+  kAssignFeedback,
+  kAssignDryWet,
+  kAssignReverb,
+  kAssignLast
+};
+const float kAssignCvOffset = 0.002f;
+volatile uint8_t assign_destination = kAssignFeedback;
+volatile float assign_cv = 0.0f;
+
 extern "C" {
 
 void SysTick_Handler() {
@@ -192,6 +209,12 @@ void SysTick_Handler() {
   }
   if (switches.just_pressed(SWITCH_SEED)) {
     reverse_latched = !reverse_latched;
+  }
+  if (switches.just_pressed(SWITCH_ASSIGN)) {
+    assign_destination = (assign_destination + 1) % kAssignLast;
+  }
+  for (int i = 0; i < kAssignLast; ++i) {
+    leds.set(Led(LED_ASSIGN_1 + i), i == assign_destination ? 128 : 0);
   }
   leds.set(LED_FREEZE, frozen ? 255 : 0);
   leds.set(LED_SEED, reversed ? 255 : 0);
@@ -388,7 +411,13 @@ void Process(
   }
   CONSTRAIN(density, 0.0f, 1.0f);
   density_target = density;
-  pitch_mix_target = cv_reader.pot(POTS_ADC_CHANNEL_REVERB);
+  const uint8_t assign_to = assign_destination;
+  const float acv = cv_reader.cv(CV_ADC_CHANNEL_ASSIGN) - kAssignCvOffset;
+  assign_cv = acv;
+  float pitch_mix = cv_reader.pot(POTS_ADC_CHANNEL_REVERB);
+  if (assign_to == kAssignReverb) pitch_mix += acv;
+  CONSTRAIN(pitch_mix, 0.0f, 1.0f);
+  pitch_mix_target = pitch_mix;
 
   // FEEDBACK knob -> the selection's amount, once the knob has moved from
   // where it was when it was picked (or everything was reset).
@@ -407,9 +436,18 @@ void Process(
   if (fx_knob_engaged) {
     fx_amount[fx_selected] = std::min(std::max(fx_knob, 0.0f), 1.0f);
   }
-  velvet_reverb_set_modulation(fx_amount[kFxModulation]);
+  // ASSIGN CV on FEEDBACK moves the selection's amount, around where the
+  // knob left it; the stored amounts (and the LED) stay the knob's.
+  float amount[kFxSlots];
+  for (int i = 0; i < kFxSlots; ++i) {
+    amount[i] = fx_amount[i];
+    if (assign_to == kAssignFeedback && i == fx_selected) {
+      amount[i] = std::min(std::max(amount[i] + acv, 0.0f), 1.0f);
+    }
+  }
+  velvet_reverb_set_modulation(amount[kFxModulation]);
   for (int i = 0; i < WET_FX_COUNT; ++i) {
-    wet_fx_set_amount(i, fx_amount[1 + i]);
+    wet_fx_set_amount(i, amount[1 + i]);
   }
 
   // An unpatched audio input carries the probe: take the other side in its
@@ -466,7 +504,9 @@ void Process(
 const float kMixEnd = 0.02f;
 
 void UpdateMix() {
-  float t = (cv_reader.pot(POTS_ADC_CHANNEL_DRY_WET) - kMixEnd) / (1.0f - 2.0f * kMixEnd);
+  float t = cv_reader.pot(POTS_ADC_CHANNEL_DRY_WET);
+  if (assign_destination == kAssignDryWet) t += assign_cv;
+  t = (t - kMixEnd) / (1.0f - 2.0f * kMixEnd);
   t = std::min(std::max(t, 0.0f), 1.0f);
   dry_gain = t >= 1.0f ? 0.0f : cosf(t * 1.5707963f);
   wet_gain = sinf(t * 1.5707963f);
