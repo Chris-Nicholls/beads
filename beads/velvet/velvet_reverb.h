@@ -101,11 +101,12 @@ extern int16_t beads_t2_ring_r_storage[T2_RING_SAMPLES];
  * float samples (normalised ±1, node-clamped ±4) so the high-feedback loop
  * doesn't accumulate int16 quantisation noise. On Beads they sit in RAM_D2
  * (2 × 64 KiB at 24 kHz). Line length is a power of two so the read/write
- * wraps are a cheap mask; it covers PRE_DELAY_MAX plus the modulation and
- * the pitch heads' crossfade room. */
+ * wraps are a cheap mask; it covers PRE_DELAY_MAX plus the modulation's
+ * reach (up to 230 samples) and the pitch heads' crossfade room (a reverse
+ * head at 2x, finishing its 25 ms crossfade, falls ~1900 behind a loop). */
 #define PRE_DELAY_LINE_SAMPLES  (16384UL * REVERB_RATE_MULT)
 #define PRE_DELAY_LINE_MASK     (PRE_DELAY_LINE_SAMPLES - 1)
-#define PRE_DELAY_MAX_SAMPLES   (12000 * REVERB_RATE_MULT)  /* 0.5 s */
+#define PRE_DELAY_MAX_SAMPLES   (13800 * REVERB_RATE_MULT)  /* 0.575 s */
 
 /* The input delay (the Beads panel's pre-delay): the reverb's input, int16 as
  * it arrives, held back by up to INPUT_DELAY_MAX_S before the sustain loop

@@ -560,15 +560,12 @@ uint32_t host_dbg_t2_gather_late  = 0;
  * reverb goes silent; at one tap in every stage the cascade is a single
  * path, and what is left is the sustain engine's loops (echoes, not a
  * wash). Counts are fractional: the tap at the boundary is part-faded. */
-/* The fewest taps Density keeps, as a share of each stage's whole span: the
- * DLD's one tap in its 40 at the DLD's window (bound_mid) for T0 and T1, so
- * the sparse end keeps the DLD's taps per second too. T2's is a rate, 0.31
- * taps a second over its whole span (about one tap in the DLD's 3.2 s
- * window), as it was when the span was 3.25 s with 80 taps; its dense end
- * is ~2.5x the DLD's. */
-#define DENSITY_T0_MIN  ((float)MAX_T0_TAPS / 40.0f)
-#define DENSITY_T1_MIN  ((float)MAX_T1_TAPS / 40.0f)
-#define DENSITY_T2_MIN  (0.3125f * T2_SPAN_MAX_S)
+/* The fewest taps Density keeps: one in every stage, so at the bottom of the
+ * knob the cascade is a single path and each of the loop's echoes comes out
+ * once (LOOP_JITTER_MAX keeps those echoes from falling into a rhythm). */
+#define DENSITY_T0_MIN  1.0f
+#define DENSITY_T1_MIN  1.0f
+#define DENSITY_T2_MIN  1.0f
 #define DENSITY_THIN_U  0.25f     /* the bottom of the knob that thins the loop (see loop_thin_target) */
 float reverb_t0_count_target = (float)MAX_T0_TAPS;   /* driven by Density */
 float reverb_t1_count_target = (float)MAX_T1_TAPS;
@@ -775,6 +772,35 @@ void velvet_reverb_apply_tone_macro   (float v) { PROF_PANEL_IGNORED(); set_macr
  * only itself instead of multiplying. Line A keeps recirculating, so turning
  * back up brings its tail straight back. */
 static float loop_thin_target = 0.0f, loop_thin_morph = 0.0f;   /* 0 = both lines, 1 = B only */
+/* With few taps the loop's echoes are what is heard, and a loop that repeats
+ * at one length is heard as a rhythm (every 299 ms at the bottom of the knob,
+ * where only line B is left). So over the bottom DENSITY_JITTER_U of the
+ * knob each pass of a line takes its own length, drawn at random within
+ * LOOP_JITTER_MAX of the line's own (all of it at the bottom, falling in a
+ * straight line to none at DENSITY_JITTER_U): the echoes come at uneven
+ * times and never settle into a beat. Above it the taps are dense enough to
+ * cover the loop's rhythm. Over the same stretch the passes also lengthen,
+ * by up to LOOP_STRETCH_MAX at the bottom, so the echoes thin out further:
+ * there line B's passes run 383-575 ms (2.1 echoes a second a side rather
+ * than 3.3), the spread narrowing as needed to keep within the lines'
+ * PRE_DELAY_MAX_SAMPLES. A new length is reached by the loop's crossfade (PdLen), never a
+ * glide, so the pitch never bends; each line's decay per pass follows its
+ * length, so the decay per second holds. The lengths hold while the loop is
+ * frozen or reversed, so what it holds plays back unchanged. */
+#define DENSITY_JITTER_U  0.5f
+#define LOOP_JITTER_MAX   0.3f
+#define LOOP_STRETCH_MAX  0.6f
+/* With few taps each side's echoes come at their own times (T2's taps wander
+ * on each side on its own), so at full width every echo sits hard on one
+ * side and they ping-pong. Over the same bottom half of the knob the width
+ * narrows, to DENSITY_WIDTH_MIN at the bottom: an echo on one side is then
+ * ~5 dB louder there than on the other, rather than on that side alone.
+ * Narrowing two uncorrelated sides loses level, so it is made back up
+ * (do_finalize). */
+#define DENSITY_WIDTH_MIN 0.3f
+static float width_target = 1.0f, width_morph = 1.0f;   /* x REVERB_STEREO_WIDTH */
+static float loop_jitter_amt = 0.0f;              /* 0..LOOP_JITTER_MAX */
+static float loop_stretch = 1.0f;                 /* 1..1 + LOOP_STRETCH_MAX */
 
 /* ==== Input delay (the panel's pre-delay) ====
  * The input goes into a ring as it arrives and is read back a delay later.
@@ -818,6 +844,11 @@ void velvet_reverb_apply_density_macro(float v)
     float x = 1.0f - v * (1.0f / DENSITY_THIN_U);
     if (x < 0.0f) x = 0.0f;
     loop_thin_target = x * x * (3.0f - 2.0f * x);
+    x = 1.0f - v * (1.0f / DENSITY_JITTER_U);
+    if (x < 0.0f) x = 0.0f;
+    loop_jitter_amt = LOOP_JITTER_MAX * x;
+    loop_stretch = 1.0f + LOOP_STRETCH_MAX * x;
+    width_target = 1.0f - (1.0f - DENSITY_WIDTH_MIN) * x;
 }
 /* No top saturation here: the windows' top is not the sensitive end. */
 void velvet_reverb_apply_size_macro   (float v) { PROF_PANEL_IGNORED(); set_macro_value(MACRO_SIZE, v); }
@@ -945,6 +976,16 @@ typedef struct {
     PdReadState rs;        /* the new read's interpolator state */
 } PdLen;
 static PdLen pre_len_a, pre_len_b, pre_len_a_r, pre_len_b_r;
+/* Each line's length for this pass as a share of its own (LOOP_JITTER_MAX,
+ * LOOP_STRETCH_MAX), and the samples until it draws the next. */
+static float loop_jit_a = 1.0f, loop_jit_b = 1.0f;
+static int32_t loop_jit_left_a, loop_jit_left_b;
+static uint32_t loop_jit_seed = 0x6C8E9CF5u;
+static float loop_jit_draw(float amt)
+{
+    uint32_t x = loop_jit_seed; x ^= x << 13; x ^= x >> 17; x ^= x << 5; loop_jit_seed = x;
+    return loop_stretch * (1.0f + amt * ((float)x * 4.6566129e-10f - 1.0f));   /* stretch x (1 +- amt) */
+}
 static float duck_env = 0.0f;
 static float fb_morph = -1.0f;     /* the loop feedback, gliding (see do_predelay); < 0 = unset */
 static Biquad pre_low_shelf_a CCM_ATTR, pre_high_shelf_a CCM_ATTR;
@@ -2256,6 +2297,9 @@ void velvet_reverb_init(void)
     pre_len_a.time = predelay_a_morph;
     pre_len_b.time = predelay_b_morph;
     pre_len_a_r = pre_len_a; pre_len_b_r = pre_len_b;
+    loop_jit_a = loop_jit_b = 1.0f;
+    loop_jit_left_a = loop_jit_left_b = 0;
+    width_morph = width_target;
 
     /* Pre-compute the exponential envelope LUT — exp(-9.21034 × frac) gives
      * an 80 dB drop over the window. Linearly interpolated at lookup. */
@@ -3961,6 +4005,29 @@ static void do_predelay(void)
     if (timeA > (float)PRE_DELAY_MAX_SAMPLES) timeA = (float)PRE_DELAY_MAX_SAMPLES;
     if (timeB < PRE_MIN_TIME_SAMPLES) timeB = PRE_MIN_TIME_SAMPLES;
     if (timeB > (float)PRE_DELAY_MAX_SAMPLES) timeB = (float)PRE_DELAY_MAX_SAMPLES;
+    /* A new length for each pass at low Density (LOOP_JITTER_MAX,
+     * LOOP_STRETCH_MAX), held while frozen or reversed. */
+    if (!freeze_request && freeze_amt == 0.0f && !reverse_request && reverse_amt == 0.0f) {
+        /* The spread, narrowed if the longer line's longest pass would pass
+         * the lines' limit. */
+        float amt = (float)PRE_DELAY_MAX_SAMPLES / (timeB * loop_stretch) - 1.0f;
+        if (amt > loop_jitter_amt) amt = loop_jitter_amt;
+        if (amt < 0.0f) amt = 0.0f;
+        loop_jit_left_a -= REVERB_BLOCK;
+        if (loop_jit_left_a <= 0) {
+            loop_jit_a = loop_jit_draw(amt);
+            loop_jit_left_a = (int32_t)(timeA * loop_jit_a);
+        }
+        loop_jit_left_b -= REVERB_BLOCK;
+        if (loop_jit_left_b <= 0) {
+            loop_jit_b = loop_jit_draw(amt);
+            loop_jit_left_b = (int32_t)(timeB * loop_jit_b);
+        }
+    }
+    timeA *= loop_jit_a;
+    timeB *= loop_jit_b;
+    if (timeA > (float)PRE_DELAY_MAX_SAMPLES) timeA = (float)PRE_DELAY_MAX_SAMPLES;
+    if (timeB > (float)PRE_DELAY_MAX_SAMPLES) timeB = (float)PRE_DELAY_MAX_SAMPLES;
     pd_len_update(&pre_len_a, timeA);
     pd_len_update(&pre_len_b, timeB);
     pd_len_update(&pre_len_a_r, timeA);
@@ -4733,6 +4800,11 @@ static void do_finalize(void)
     float pL = prev_out_L;
     float pR = prev_out_R;
 #endif
+    /* The width (Density narrows it, see DENSITY_WIDTH_MIN), gliding as the
+     * windows do, with the level two uncorrelated sides lose made back. */
+    width_morph += ALPHA_WINDOW_MORPH * (width_target - width_morph);
+    const float sw = REVERB_STEREO_WIDTH * width_morph;
+    const float wk = sqrtf((1.0f + REVERB_STEREO_WIDTH * REVERB_STEREO_WIDTH) / (1.0f + sw * sw));
 
 #ifdef DIAG_NO_LIMITER
     /* Baseline for A/B, both sonic and for cycle counting: the pre-limiter output
@@ -4742,9 +4814,9 @@ static void do_finalize(void)
         rawL = soft_clip_unit(t2_out_l[i]) * (REVERB_OUT_MAKEUP * 32767.0f);
         rawR = soft_clip_unit(t2_out_r[i]) * (REVERB_OUT_MAKEUP * 32767.0f);
         float m = 0.5f * (rawL + rawR);
-        float s = 0.5f * (rawL - rawR) * REVERB_STEREO_WIDTH;
-        float curL = m + s;
-        float curR = m - s;
+        float s = 0.5f * (rawL - rawR) * sw;
+        float curL = wk * (m + s);
+        float curR = wk * (m - s);
 #if REVERB_DECIM == 2
         float midL = (pL + curL) * 0.5f;
         float midR = (pR + curR) * 0.5f;
@@ -4780,9 +4852,9 @@ static void do_finalize(void)
         rawL = soft_clip_unit(t2_out_l[i]) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
         rawR = soft_clip_unit(t2_out_r[i]) * (REVERB_OUT_MAKEUP * (32767.0f / 32768.0f));
         float m = 0.5f * (rawL + rawR);
-        float s = 0.5f * (rawL - rawR) * REVERB_STEREO_WIDTH;
-        float curL = m + s;
-        float curR = m - s;
+        float s = 0.5f * (rawL - rawR) * sw;
+        float curL = wk * (m + s);
+        float curR = wk * (m - s);
 #if REVERB_DECIM == 2
         fxL[2 * i] = (pL + curL) * 0.5f;  fxR[2 * i] = (pR + curR) * 0.5f;
         fxL[2 * i + 1] = curL;            fxR[2 * i + 1] = curR;
