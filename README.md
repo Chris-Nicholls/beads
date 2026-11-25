@@ -1,45 +1,34 @@
-Mutable Instruments' Eurorack Modules.
+Velvet reverb firmware for Beads hardware.
 
-* [Beads](http://mutable-instruments.net/modules/beads): Texture synthesizer (1).
-* [Blades](http://mutable-instruments.net/modules/blades): Dual multimode filter.
-* [Blinds](http://mutable-instruments.net/modules/blinds): Quad VC-polarizer.
-* [Braids](http://mutable-instruments.net/modules/braids): Macro-oscillator.
-* [Branches](http://mutable-instruments.net/modules/branches): Dual Bernoulli gate.
-* [Clouds](http://mutable-instruments.net/modules/clouds): Texture synthesizer.
-* [Ears](http://mutable-instruments.net/modules/ears): Contact microphone.
-* [Edges](http://mutable-instruments.net/modules/edges): Quad chiptune digital oscillator.
-* [Elements](http://mutable-instruments.net/modules/elements): Modal synthesizer.
-* [Frames](http://mutable-instruments.net/modules/frames): Keyframer/mixer.
-* [Grids](http://mutable-instruments.net/modules/grids): Topographic drum sequencer.
-* [Kinks](http://mutable-instruments.net/modules/kinks): Utility module - rectifier, analog logic, S&H, noise.
-* [Links](http://mutable-instruments.net/modules/links): Utility module - buffer, mixer.
-* [Marbles](http://mutable-instruments.net/modules/marbles): Random sampler.
-* [Peaks](http://mutable-instruments.net/modules/peaks): Dual trigger converter.
-* [Plaits](http://mutable-instruments.net/modules/plaits): Macro oscillator.
-* [Rings](http://mutable-instruments.net/modules/rings): Resonator.
-* [Ripples](http://mutable-instruments.net/modules/ripples): Liquid 2-pole BP, 2-pole LP and 4-pole LP filter.
-* [Shades](http://mutable-instruments.net/modules/shades): Triple attenuverter.
-* [Shelves](http://mutable-instruments.net/modules/shelves): EQ filter.
-* [Stages](http://mutable-instruments.net/modules/stages): Segment generator.
-* [Streams](http://mutable-instruments.net/modules/streams): Dual dynamics gate.
-* [Tides](http://mutable-instruments.net/modules/tides): Tidal modulator.
-* [Veils](http://mutable-instruments.net/modules/veils): Quad VCA.
-* [Volts](http://mutable-instruments.net/modules/volts): +5V power module.
-* [Warps](http://mutable-instruments.net/modules/warps): Meta-modulator.
-* [Yarns](http://mutable-instruments.net/modules/yarns): MIDI interface.
+A reverb-only firmware for the Beads module: the DLD's velvet-noise reverb
+(`beads/velvet/`) in place of the granular engine, with the panel remapped
+to the reverb's controls (see the panel notes at the top of
+`beads/beads.cc`). The original granular main is kept as
+`beads/beads_granular.cc.orig`.
 
-(1) Code provided as is, builds on a Desktop platform but not verified to build and run on a module. Install at your own risks.
+* `beads/` – the firmware, its drivers, resources and bootloader.
+* `beads/velvet/` – the reverb engine and the wet-signal effects.
+* `stmlib/`, `stm_audio_bootloader/` – support libraries (submodules).
+
+Building
+========
+
+    git submodule update --init
+    make -f beads/makefile bin
+
+Set `TOOLCHAIN_PATH` to the folder holding `bin/arm-none-eabi-gcc` if it is
+not the makefile's default (for example `TOOLCHAIN_PATH=/opt/homebrew/`).
+
+Code provided as is, not verified to run on every module. Install at your own risk.
 
 License
 =======
 
-Code (AVR projects): GPL3.0.
-
-Code (STM32F projects): MIT license.
+Code: MIT license.
 
 Hardware: cc-by-sa-3.0
 
-By: Emilie Gillet (emilie.o.gillet@gmail.com)
+Original Beads code and hardware by Emilie Gillet (emilie.o.gillet@gmail.com).
 
 Guidelines for derivative works
 ===============================
@@ -49,5 +38,3 @@ Guidelines for derivative works
 The name "Mutable Instruments" should not be used on any of the derivative works you create from these files.
 
 We do not recommend you to keep the original name of the Mutable Instruments module for your derivative works.
-
-For example, your 5U adaptation of Mutable Instruments Clouds can be called "Foobar Modular - Particle Generator".
